@@ -46,4 +46,8 @@
   <ItemGroup>
     <Compile Remove="output\**" />
   </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Discovery\Persistence\Migrations\*.sql" />
+  </ItemGroup>
 </Project>

@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Discovery Factory — Review Queue</title>
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    body { background: #0f172a; color: #e2e8f0; font-family: system-ui, sans-serif; margin: 0; padding: 24px; }
+    a { color: #60a5fa; }
+    h1 { margin-top: 0; }
+    .toolbar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
+    select, button { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; }
+    button { cursor: pointer; }
+    button:hover { background: #334155; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    .card h3 { margin-top: 0; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; margin-left: 8px; }
+    .badge-candidate { background: #475569; }
+    .badge-review { background: #b45309; }
+    .badge-published { background: #15803d; }
+    .badge-rejected { background: #b91c1c; }
+    .badge-needs-evidence { background: #b45309; }
+    .badge-redacted { background: #7c3aed; }
+    .badge-clean { background: #334155; }
+    .evidence { background: #0b1220; border: 1px solid #334155; border-radius: 6px; padding: 8px; margin: 6px 0; font-family: monospace; font-size: 13px; white-space: pre-wrap; }
+    .why { background: #0b1220; border-left: 3px solid #f59e0b; padding: 8px 12px; margin: 8px 0; }
+    .actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
+    .actions input[type="text"] { flex: 1; min-width: 240px; background: #0b1220; border: 1px solid #334155; color: #e2e8f0; border-radius: 6px; padding: 6px 10px; }
+    .btn-publish { background: #15803d; }
+    .btn-reject { background: #b91c1c; }
+    .btn-evidence { background: #b45309; }
+    .empty { opacity: 0.7; font-style: italic; }
+    .error { color: #f87171; }
+  </style>
+</head>
+<body>
+  <h1>🔎 Discovery Factory — Review Queue</h1>
+  <p><a href="index.html">&larr; Back to migration insights</a></p>
+
+  <div class="toolbar">
+    <label for="run-select">Run:</label>
+    <select id="run-select"></select>
+    <button id="refresh-btn">⟳ Refresh</button>
+    <span id="status-msg"></span>
+  </div>
+
+  <div id="queue"></div>
+
+  <script src="discovery-review.js"></script>
+</body>
+</html>

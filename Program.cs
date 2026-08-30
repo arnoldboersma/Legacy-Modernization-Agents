@@ -30,7 +30,7 @@ internal static class Program
         Directory.CreateDirectory(logsDirectory);
 
         // Only enable live logging for migration runs (not MCP server or conversation modes)
-        var isMigrationRun = !args.Contains("mcp") && !args.Contains("conversation");
+        var isMigrationRun = !args.Contains("mcp") && !args.Contains("conversation") && !args.Contains("discovery");
         LiveLogWriter? liveLogWriter = null;
 
         if (isMigrationRun)
@@ -149,6 +149,9 @@ internal static class Program
 
         // Curated program-facts.json extraction from REKT artifacts.
         rootCommand.AddCommand(CobolToQuarkusMigration.Cli.ProgramFactsCommand.Build(loggerFactory));
+
+        // Discovery Factory pilot slice: governed runs, review lifecycle, and exports.
+        rootCommand.AddCommand(CobolToQuarkusMigration.Cli.DiscoveryCommand.Build(loggerFactory));
 
         rootCommand.SetHandler(async (string cobolSource, string javaOutput, string reverseEngineerOutput, bool reverseEngineerOnly, bool skipReverseEngineering, bool reuseRe, string configPath, bool resume) =>
         {
