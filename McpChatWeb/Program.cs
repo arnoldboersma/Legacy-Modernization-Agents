@@ -96,7 +96,23 @@ builder.Services.AddSingleton<McpChatWeb.Services.ProcessManager>(sp =>
 builder.Services.AddSingleton<PortalState>();
 builder.Services.AddOpenApi();
 
+builder.Services.AddSingleton<CobolToQuarkusMigration.Discovery.Persistence.IDiscoveryRepository>(sp =>
+{
+	var contentRoot = builder.Environment.ContentRootPath;
+	var repoRoot = Path.GetFullPath("..", contentRoot);
+	var databasePath = Path.Combine(repoRoot, "Data", "discovery.db");
+	var logger = sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<CobolToQuarkusMigration.Discovery.Persistence.SqliteDiscoveryRepository>>();
+	return new CobolToQuarkusMigration.Discovery.Persistence.SqliteDiscoveryRepository(databasePath, logger);
+});
+builder.Services.AddSingleton<CobolToQuarkusMigration.Discovery.DiscoveryService>();
+
 var app = builder.Build();
+
+{
+	using var scope = app.Services.CreateScope();
+	var discoveryRepository = scope.ServiceProvider.GetRequiredService<CobolToQuarkusMigration.Discovery.Persistence.IDiscoveryRepository>();
+	await discoveryRepository.InitializeAsync();
+}
 
 // Helper to resolve the migration database path consistently
 string GetMigrationDbPath()
@@ -6398,4 +6414,124 @@ app.MapGet("/api/reports/available", () =>
 	}
 });
 
+// ---------------------------------------------------------------------------
+// Discovery Factory pilot slice: review queue API (issues #2, #4, #7).
+// Uses a dedicated Data/discovery.db and never touches legacy migration tables.
+// ---------------------------------------------------------------------------
+
+app.MapGet("/api/discovery/runs", async (CobolToQuarkusMigration.Discovery.Persistence.IDiscoveryRepository repo) =>
+{
+	var runs = await repo.GetAllRunsAsync();
+	return Results.Ok(runs);
+});
+
+app.MapGet("/api/discovery/runs/{runId}/queue", async (string runId, CobolToQuarkusMigration.Discovery.DiscoveryService svc) =>
+{
+	var queue = await svc.GetReviewQueueAsync(runId);
+	var items = new List<object>();
+	foreach (var revision in queue)
+	{
+		var assessment = await svc.GetLlmAssessmentAsync(revision.FindingRevisionId);
+		var evidence = await svc.GetEvidenceByIdsAsync(revision.EvidenceIds);
+		items.Add(new
+		{
+			revision.FindingRevisionId,
+			revision.FindingId,
+			revision.RevisionNumber,
+			Status = revision.Status.ToString(),
+			revision.Statement,
+			revision.Confidence,
+			CitedEvidenceIds = revision.EvidenceIds,
+			LlmAssessment = assessment == null ? null : new
+			{
+				assessment.ReviewPriority,
+				assessment.WhyExplanation,
+				assessment.CitedEvidenceIds,
+				assessment.ModelId,
+				assessment.CreatedAtUtc
+			},
+			Evidence = evidence.Select(e => new
+			{
+				e.EvidenceId,
+				Type = e.Type.ToString(),
+				e.RedactedExcerpt,
+				e.WasRedacted,
+				e.RedactionSummary
+			}),
+			revision.CreatedAtUtc
+		});
+	}
+
+	return Results.Ok(items);
+});
+
+app.MapGet("/api/discovery/findings/{findingRevisionId}", async (string findingRevisionId, CobolToQuarkusMigration.Discovery.Persistence.IDiscoveryRepository repo) =>
+{
+	var revision = await repo.GetFindingRevisionAsync(findingRevisionId);
+	if (revision is null)
+	{
+		return Results.NotFound();
+	}
+
+	var decisions = await repo.GetReviewDecisionsAsync(findingRevisionId);
+	return Results.Ok(new { revision, decisions });
+});
+
+app.MapPost("/api/discovery/findings/{findingRevisionId}/publish", async (string findingRevisionId, DiscoveryDecisionRequest body, CobolToQuarkusMigration.Discovery.DiscoveryService svc) =>
+{
+	if (string.IsNullOrWhiteSpace(body.Rationale))
+	{
+		return Results.BadRequest(new { error = "Rationale is required." });
+	}
+
+	try
+	{
+		var decision = await svc.PublishAsync(findingRevisionId, body.Rationale, body.ReviewerIdentity);
+		return Results.Ok(decision);
+	}
+	catch (InvalidOperationException ex)
+	{
+		return Results.BadRequest(new { error = ex.Message });
+	}
+});
+
+app.MapPost("/api/discovery/findings/{findingRevisionId}/reject", async (string findingRevisionId, DiscoveryDecisionRequest body, CobolToQuarkusMigration.Discovery.DiscoveryService svc) =>
+{
+	if (string.IsNullOrWhiteSpace(body.Rationale))
+	{
+		return Results.BadRequest(new { error = "Rationale is required." });
+	}
+
+	try
+	{
+		var decision = await svc.RejectAsync(findingRevisionId, body.Rationale, body.ReviewerIdentity);
+		return Results.Ok(decision);
+	}
+	catch (InvalidOperationException ex)
+	{
+		return Results.BadRequest(new { error = ex.Message });
+	}
+});
+
+app.MapPost("/api/discovery/findings/{findingRevisionId}/request-evidence", async (string findingRevisionId, DiscoveryDecisionRequest body, CobolToQuarkusMigration.Discovery.DiscoveryService svc) =>
+{
+	if (string.IsNullOrWhiteSpace(body.Rationale))
+	{
+		return Results.BadRequest(new { error = "Rationale is required." });
+	}
+
+	try
+	{
+		var decision = await svc.RequestEvidenceAsync(findingRevisionId, body.Rationale, body.ReviewerIdentity);
+		return Results.Ok(decision);
+	}
+	catch (InvalidOperationException ex)
+	{
+		return Results.BadRequest(new { error = ex.Message });
+	}
+});
+
 app.Run();
+
+/// <summary>Request body for Discovery review-queue decision endpoints.</summary>
+record DiscoveryDecisionRequest(string Rationale, string? ReviewerIdentity);

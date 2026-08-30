@@ -562,3 +562,49 @@ runtime environment startup, or knowledge of private Forecast rules.
   observability, and delivery concerns?
 - Are graph and RAG capabilities correctly deferred without blocking the semantic-model
   foundation?
+
+## 14. Implementation notes (first vertical slice)
+
+This section documents implementation decisions made while building the first Discovery
+Factory vertical slice (issues #2, #4, #7), where the design left an explicit choice open
+or where the pilot environment differed from the assumptions in earlier sections. It does
+not change the deferred decisions in §12.
+
+- **Separate persistence store for the pilot.** The slice introduces its own SQLite
+  database (`Data/discovery.db`) and repository contract (`IDiscoveryRepository` /
+  `SqliteDiscoveryRepository`), independent of the existing migration repository
+  (`IMigrationRepository` / `Data/migration.db`). This satisfies the "neutral persistence"
+  requirement in #7 without touching or risking the existing migration behavior, and keeps
+  the governed-record-store authority decision (§12) genuinely open — the pilot store is
+  disposable and swappable. Schema is applied via versioned, embedded SQL migrations
+  (`Discovery/Persistence/Migrations/0001_initial.sql`) tracked in a `schema_migrations`
+  table, following the same "one file per version, never edited after release" convention
+  implied by §7.
+- **PlanBord repository unavailable in this environment.** §9 assumes discovery is run
+  against the PlanBord codebase. That repository is not accessible from this development
+  environment, so the pilot's `discovery seed-demo` CLI command instead performs
+  deterministic extraction against the existing local `source/*.cbl` sample already used by
+  the legacy migration tooling. This is a substitution for demonstrating the slice
+  end-to-end, not a scope change; the extraction, redaction, and lifecycle logic are
+  identical regardless of which COBOL source tree is scanned.
+- **Append-only status transitions, not row mutation.** A finding's lifecycle
+  (candidate → human review → published | rejected | needs evidence) and its corrections
+  are both represented as new `finding_revisions` rows rather than as updates. A reviewer
+  decision (`review_decisions`) is an immutable audit record; the resulting status is
+  reflected by appending a new revision that copies the prior statement/evidence/confidence
+  forward and only changes status and `supersedes_revision_id`. A correction
+  (`CreateCorrectionAsync`) first appends a "Superseded" status revision for the prior
+  published statement, then appends the corrected statement as a new Candidate revision
+  referencing it — so the correction, not the superseded marker, is always the current
+  revision, and no history row is ever overwritten or deleted.
+- **LLM assessments never establish or publish a finding.** `AttachLlmAssessmentAsync`
+  can only move a finding from Candidate to HumanReview and stores a review-priority score,
+  a "why" explanation, and cited evidence; it has no path to Published, Rejected, or
+  NeedsEvidence. Only a human reviewer decision through `PublishAsync`/`RejectAsync`/
+  `RequestEvidenceAsync` can change closure status, consistent with §5.4.
+- **Reviewer identity.** Per the task scope, the pilot assumes a single local `Reviewer`
+  identity (`DiscoveryService.DefaultReviewerIdentity`) with no authentication or role
+  management; this is recorded on every review decision but is not currently validated
+  against any identity provider.
+
+
