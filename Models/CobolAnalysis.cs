@@ -3,22 +3,21 @@ namespace CobolToQuarkusMigration.Models;
 /// <summary>
 /// Represents the analysis of a COBOL file.
 /// </summary>
-public class CobolAnalysis
+public class CobolAnalysis : SourceAnalysis
 {
+    public CobolAnalysis() => Language = SourceLanguage.Cobol;
+
     /// <summary>
     /// Gets or sets the file name.
     /// </summary>
-    public string FileName { get; set; } = string.Empty;
-    
-    /// <summary>
-    /// Gets or sets the file path.
-    /// </summary>
-    public string FilePath { get; set; } = string.Empty;
-    
     /// <summary>
     /// Gets or sets whether this is a copybook file.
     /// </summary>
-    public bool IsCopybook { get; set; }
+    public bool IsCopybook
+    {
+        get => IsSupportFile;
+        set => IsSupportFile = value;
+    }
     
     /// <summary>
     /// Gets or sets the overall description of the COBOL program.

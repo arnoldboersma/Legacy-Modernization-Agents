@@ -167,6 +167,51 @@ public class BusinessLogicExtractorAgent : AgentBase
     }
 
     /// <summary>
+    /// Extracts business logic from a language-neutral source artifact using a caller-provided, grounded prompt.
+    /// </summary>
+    public async Task<BusinessLogic> ExtractBusinessLogicAsync(
+        SourceFile sourceFile,
+        string systemPrompt,
+        string userPrompt)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        Logger.LogInformation("Extracting business logic from: {FileName}", sourceFile.FileName);
+
+        try
+        {
+            var (analysisText, usedFallback, fallbackReason) = await ExecuteWithFallbackAsync(
+                systemPrompt,
+                userPrompt,
+                sourceFile.FileName);
+
+            if (usedFallback)
+            {
+                return new BusinessLogic
+                {
+                    FileName = sourceFile.FileName,
+                    FilePath = sourceFile.FilePath,
+                    IsCopybook = sourceFile.IsSupportFile,
+                    BusinessPurpose = $"Business logic extraction unavailable: {fallbackReason}"
+                };
+            }
+
+            stopwatch.Stop();
+            EnhancedLogger?.LogPerformanceMetrics($"Business Logic Extraction - {sourceFile.FileName}", stopwatch.Elapsed, 1);
+            var businessLogic = ParseBusinessLogicResponse(sourceFile, analysisText);
+            EnsureUsableBusinessLogic(
+                businessLogic,
+                message => Logger.LogWarning("{Message} File: {FileName}", message, sourceFile.FileName));
+            return businessLogic;
+        }
+        catch (Exception ex)
+        {
+            stopwatch.Stop();
+            Logger.LogError(ex, "Error extracting business logic from: {FileName}", sourceFile.FileName);
+            throw;
+        }
+    }
+
+    /// <summary>
     /// Chunking-enabled extraction method.
     /// </summary>
     private async Task<BusinessLogic> ExtractWithChunkingAsync(CobolFile cobolFile, CobolAnalysis analysis, Glossary? glossary)
@@ -441,19 +486,19 @@ public class BusinessLogicExtractorAgent : AgentBase
             exception.GetType().Name);
     }
 
-    internal static BusinessLogic ParseBusinessLogicResponse(CobolFile cobolFile, string analysisText)
+    internal static BusinessLogic ParseBusinessLogicResponse(SourceFile sourceFile, string analysisText)
     {
         var businessLogic = new BusinessLogic
         {
-            FileName = cobolFile.FileName,
-            FilePath = cobolFile.FilePath,
-            IsCopybook = cobolFile.IsCopybook,
+            FileName = sourceFile.FileName,
+            FilePath = sourceFile.FilePath,
+            IsCopybook = sourceFile.IsSupportFile,
             BusinessPurpose = ExtractBusinessPurpose(analysisText)
         };
 
-        businessLogic.UserStories = ExtractUserStories(analysisText, cobolFile.FileName);
-        businessLogic.Features = ExtractFeatures(analysisText, cobolFile.FileName);
-        businessLogic.BusinessRules = ExtractBusinessRules(analysisText, cobolFile.FileName);
+        businessLogic.UserStories = ExtractUserStories(analysisText, sourceFile.FileName);
+        businessLogic.Features = ExtractFeatures(analysisText, sourceFile.FileName);
+        businessLogic.BusinessRules = ExtractBusinessRules(analysisText, sourceFile.FileName);
 
         return businessLogic;
     }

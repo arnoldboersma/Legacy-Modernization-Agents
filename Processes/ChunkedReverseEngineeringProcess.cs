@@ -242,7 +242,8 @@ public class ChunkedReverseEngineeringProcess
             _enhancedLogger.ShowStep(4, totalSteps, "Dependency Mapping", "Analyzing inter-program dependencies and copybook usage");
             progressCallback?.Invoke("Mapping dependencies", 4, totalSteps);
 
-            var dependencyMap = await _dependencyMapperAgent.AnalyzeDependenciesAsync(cobolFiles, result.TechnicalAnalyses);
+            var dependencyMap = await _dependencyMapperAgent.AnalyzeDependenciesAsync(
+                cobolFiles, result.TechnicalAnalyses.OfType<CobolAnalysis>().ToList());
             _enhancedLogger.ShowSuccess($"Dependency analysis complete - {dependencyMap.Dependencies.Count} relationships found");
             result.DependencyMap = dependencyMap;
 
@@ -735,7 +736,7 @@ ON CONFLICT(run_id, source_file, chunk_index) DO NOTHING;";
         sb.AppendLine("## Technical Analysis");
         sb.AppendLine();
 
-        foreach (var analysis in result.TechnicalAnalyses)
+        foreach (var analysis in result.TechnicalAnalyses.OfType<CobolAnalysis>())
         {
             var fileTypeLabel = analysis.IsCopybook ? " [Copybook]" : "";
             sb.AppendLine($"### {analysis.FileName}{fileTypeLabel}");

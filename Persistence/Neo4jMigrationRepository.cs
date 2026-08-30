@@ -42,8 +42,9 @@ public class Neo4jMigrationRepository
                 await tx.RunAsync(
                     "MERGE (r:Run {id: $runId}) SET r.timestamp = datetime()",
                     new { runId });
+                await tx.RunAsync("MATCH (legacy:CobolFile) SET legacy:SourceArtifact");
 
-                // Create CobolFile nodes from dependency relationships
+                // SourceArtifact is the shared graph node for every source language.
                 var allFiles = new HashSet<string>();
                 foreach (var dep in dependencyMap.Dependencies)
                 {
@@ -53,16 +54,20 @@ public class Neo4jMigrationRepository
 
                 foreach (var fileName in allFiles)
                 {
-                    // Determine if it's a copybook based on file extension or usage
+                    // Keep the CobolFile label for existing graph clients while allowing
+                    // non-COBOL source and symbol nodes in the same dependency graph.
                     var isCopybook = fileName.EndsWith(".cpy", StringComparison.OrdinalIgnoreCase) ||
                                    fileName.EndsWith(".CPY", StringComparison.OrdinalIgnoreCase) ||
                                    dependencyMap.ReverseDependencies.ContainsKey(fileName);
+                    var language = GetSourceLanguage(fileName);
 
                     await tx.RunAsync(@"
-                        MERGE (f:CobolFile {fileName: $fileName})
+                        MERGE (f:SourceArtifact {fileName: $fileName})
                         SET f.isCopybook = $isCopybook,
+                            f.language = $language,
                             f.runId = $runId,
                             f.lineCount = 0
+                        FOREACH (_ IN CASE WHEN $language = 'Cobol' THEN [1] ELSE [] END | SET f:CobolFile)
                         WITH f
                         MATCH (r:Run {id: $runId})
                         MERGE (r)-[:ANALYZED]->(f)",
@@ -70,6 +75,7 @@ public class Neo4jMigrationRepository
                         {
                             fileName,
                             isCopybook,
+                            language,
                             runId
                         });
                 }
@@ -78,8 +84,8 @@ public class Neo4jMigrationRepository
                 foreach (var dependency in dependencyMap.Dependencies)
                 {
                     await tx.RunAsync(@"
-                        MATCH (source:CobolFile {fileName: $source})
-                        MATCH (target:CobolFile {fileName: $target})
+                        MATCH (source:SourceArtifact {fileName: $source})
+                        MATCH (target:SourceArtifact {fileName: $target})
                         MERGE (source)-[d:DEPENDS_ON]->(target)
                         SET d.type = $type,
                             d.lineNumber = $lineNumber,
@@ -95,6 +101,7 @@ public class Neo4jMigrationRepository
                             runId
                         });
                 }
+
             });
 
             _logger.LogInformation($"Saved dependency graph to Neo4j for run {runId}");
@@ -106,6 +113,15 @@ public class Neo4jMigrationRepository
         }
     }
 
+    private static string GetSourceLanguage(string artifactName)
+    {
+        if (artifactName.EndsWith(".cbl", StringComparison.OrdinalIgnoreCase) ||
+            artifactName.EndsWith(".cob", StringComparison.OrdinalIgnoreCase) ||
+            artifactName.EndsWith(".cpy", StringComparison.OrdinalIgnoreCase))
+            return "Cobol";
+        return "CSharp";
+    }
+
     public async Task<List<CircularDependency>> GetCircularDependenciesAsync(int runId)
     {
         await using var session = _driver.AsyncSession();
@@ -113,8 +129,8 @@ public class Neo4jMigrationRepository
         var result = await session.ExecuteReadAsync(async tx =>
         {
             var cursor = await tx.RunAsync(@"
-                MATCH path = (start:CobolFile)-[:DEPENDS_ON*2..10]->(start)
-                WHERE start.runId = $runId
+                MATCH path = (start)-[:DEPENDS_ON*2..10]->(start)
+                WHERE start.runId = $runId AND (start:SourceArtifact OR start:CobolFile)
                 WITH path, length(path) as pathLength
                 ORDER BY pathLength
                 RETURN [node in nodes(path) | node.fileName] as cycle, pathLength
@@ -145,8 +161,8 @@ public class Neo4jMigrationRepository
         {
             // Find all files affected by this file (downstream)
             var downstreamCursor = await tx.RunAsync(@"
-                MATCH (source:CobolFile {fileName: $fileName})
-                WHERE source.runId = $runId
+                MATCH (source {fileName: $fileName})
+                WHERE source.runId = $runId AND (source:SourceArtifact OR source:CobolFile)
                 MATCH path = (source)<-[:DEPENDS_ON*1..5]-(affected)
                 RETURN DISTINCT affected.fileName as fileName, length(path) as distance
                 ORDER BY distance, fileName",
@@ -160,8 +176,8 @@ public class Neo4jMigrationRepository
 
             // Find all dependencies of this file (upstream)
             var upstreamCursor = await tx.RunAsync(@"
-                MATCH (source:CobolFile {fileName: $fileName})
-                WHERE source.runId = $runId
+                MATCH (source {fileName: $fileName})
+                WHERE source.runId = $runId AND (source:SourceArtifact OR source:CobolFile)
                 MATCH path = (source)-[:DEPENDS_ON*1..5]->(dependency)
                 RETURN DISTINCT dependency.fileName as fileName, length(path) as distance
                 ORDER BY distance, fileName",
@@ -193,8 +209,8 @@ public class Neo4jMigrationRepository
         var result = await session.ExecuteReadAsync(async tx =>
         {
             var cursor = await tx.RunAsync(@"
-                MATCH (f:CobolFile)
-                WHERE f.runId = $runId
+                MATCH (f)
+                WHERE f.runId = $runId AND (f:SourceArtifact OR f:CobolFile)
                 OPTIONAL MATCH (f)<-[incoming:DEPENDS_ON]-()
                 OPTIONAL MATCH (f)-[outgoing:DEPENDS_ON]->()
                 WITH f, count(DISTINCT incoming) as incomingCount, count(DISTINCT outgoing) as outgoingCount
@@ -234,8 +250,10 @@ public class Neo4jMigrationRepository
         {
             _logger.LogInformation("🔍 Executing Neo4j query WHERE source.runId = {RunId} AND target.runId = {RunId2}", runId, runId);
             var cursor = await tx.RunAsync(@"
-                MATCH (source:CobolFile)-[d:DEPENDS_ON]->(target:CobolFile)
+                MATCH (source)-[d:DEPENDS_ON]->(target)
                 WHERE source.runId = $runId AND target.runId = $runId
+                  AND (source:SourceArtifact OR source:CobolFile)
+                  AND (target:SourceArtifact OR target:CobolFile)
                 RETURN source.fileName as source, 
                        target.fileName as target,
                        source.isCopybook as sourceCopybook,
@@ -293,8 +311,8 @@ public class Neo4jMigrationRepository
         var result = await session.ExecuteReadAsync(async tx =>
         {
             var cursor = await tx.RunAsync(@"
-                MATCH (f:CobolFile)
-                WHERE f.runId IS NOT NULL
+                MATCH (f)
+                WHERE f.runId IS NOT NULL AND (f:SourceArtifact OR f:CobolFile)
                 RETURN DISTINCT f.runId as runId
                 ORDER BY runId DESC");
 
@@ -347,7 +365,7 @@ public class Neo4jMigrationRepository
                         c.semanticUnits = $semanticUnits,
                         c.completedAt = $completedAt
                     WITH c
-                    MATCH (f:CobolFile {fileName: $sourceFile, runId: $runId})
+                    MATCH (f:SourceArtifact {fileName: $sourceFile, runId: $runId})
                     MERGE (f)-[:HAS_CHUNK]->(c)",
                     new
                     {
@@ -397,7 +415,7 @@ public class Neo4jMigrationRepository
                         s.returnType = $returnType,
                         s.definedInChunk = $definedInChunk
                     WITH s
-                    MATCH (f:CobolFile {fileName: $sourceFile, runId: $runId})
+                    MATCH (f:SourceArtifact {fileName: $sourceFile, runId: $runId})
                     MERGE (f)-[:DEFINES_SIGNATURE]->(s)",
                     new
                     {

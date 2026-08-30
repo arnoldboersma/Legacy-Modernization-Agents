@@ -1,393 +1,232 @@
+using System.Text;
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
-using CobolToQuarkusMigration.Agents;
-using CobolToQuarkusMigration.Agents.Interfaces;
 using CobolToQuarkusMigration.Helpers;
 using CobolToQuarkusMigration.Models;
 using CobolToQuarkusMigration.Persistence;
-using System.Text.Json;
+using CobolToQuarkusMigration.SourceAnalysis.Interfaces;
 
 namespace CobolToQuarkusMigration.Processes;
 
-/// <summary>
-/// Orchestrates the reverse engineering process for COBOL applications.
-/// Can run standalone or as part of the full migration pipeline.
-/// </summary>
+/// <summary>Orchestrates discovery, analysis, business extraction, and dependency mapping for one source language.</summary>
 public class ReverseEngineeringProcess
 {
-    private readonly ICobolAnalyzerAgent _cobolAnalyzerAgent;
-    private readonly BusinessLogicExtractorAgent _businessLogicExtractorAgent;
-    private readonly IDependencyMapperAgent _dependencyMapperAgent;
-    private readonly FileHelper _fileHelper;
+    private readonly ISourceDiscovery _sourceDiscovery;
+    private readonly ISourceAnalyzer _sourceAnalyzer;
+    private readonly ISourceBusinessLogicExtractor _businessLogicExtractor;
+    private readonly IDependencyAnalyzer _dependencyAnalyzer;
+    private readonly ISourceAnalysisReportFormatter _reportFormatter;
     private readonly ILogger<ReverseEngineeringProcess> _logger;
     private readonly EnhancedLogger _enhancedLogger;
     private readonly IMigrationRepository? _migrationRepository;
+    private readonly ISourceFilePersistence? _sourceFilePersistence;
     private Glossary? _glossary;
 
     public ReverseEngineeringProcess(
-        ICobolAnalyzerAgent cobolAnalyzerAgent,
-        BusinessLogicExtractorAgent businessLogicExtractorAgent,
-        IDependencyMapperAgent dependencyMapperAgent,
-        FileHelper fileHelper,
+        ISourceDiscovery sourceDiscovery,
+        ISourceAnalyzer sourceAnalyzer,
+        ISourceBusinessLogicExtractor businessLogicExtractor,
+        IDependencyAnalyzer dependencyAnalyzer,
+        ISourceAnalysisReportFormatter reportFormatter,
         ILogger<ReverseEngineeringProcess> logger,
         EnhancedLogger enhancedLogger,
-        IMigrationRepository? migrationRepository = null)
+        IMigrationRepository? migrationRepository = null,
+        ISourceFilePersistence? sourceFilePersistence = null)
     {
-        _cobolAnalyzerAgent = cobolAnalyzerAgent;
-        _businessLogicExtractorAgent = businessLogicExtractorAgent;
-        _dependencyMapperAgent = dependencyMapperAgent;
-        _fileHelper = fileHelper;
+        ArgumentException.ThrowIfNullOrWhiteSpace(sourceDiscovery.Language.ToString());
+        if (sourceDiscovery.Language != sourceAnalyzer.Language ||
+            sourceDiscovery.Language != businessLogicExtractor.Language ||
+            sourceDiscovery.Language != dependencyAnalyzer.Language)
+            throw new ArgumentException("All source-analysis services must target the same language.");
+
+        _sourceDiscovery = sourceDiscovery;
+        _sourceAnalyzer = sourceAnalyzer;
+        _businessLogicExtractor = businessLogicExtractor;
+        _dependencyAnalyzer = dependencyAnalyzer;
+        _reportFormatter = reportFormatter;
         _logger = logger;
         _enhancedLogger = enhancedLogger;
         _migrationRepository = migrationRepository;
+        _sourceFilePersistence = sourceFilePersistence;
     }
 
-    /// <summary>
-    /// Runs the reverse engineering process.
-    /// </summary>
-    /// <param name="cobolSourceFolder">The folder containing COBOL source files.</param>
-    /// <param name="outputFolder">The folder for reverse engineering output.</param>
-    /// <param name="progressCallback">Optional callback for progress reporting.</param>
-    /// <param name="existingRunId">Optional run ID to attach to.</param>
-    /// <returns>A task representing the asynchronous operation.</returns>
     public async Task<ReverseEngineeringResult> RunAsync(
-        string cobolSourceFolder,
+        string sourceFolder,
         string outputFolder,
         Action<string, int, int>? progressCallback = null,
-        int? existingRunId = null)
+        int? existingRunId = null,
+        CancellationToken cancellationToken = default)
     {
         var result = new ReverseEngineeringResult();
-
         try
         {
             _enhancedLogger.ShowSectionHeader("REVERSE ENGINEERING PROCESS", "Extracting Business Logic and Technical Details");
-            _logger.LogInformation("Starting reverse engineering process");
-            _logger.LogInformation("Source folder: {SourceFolder}", cobolSourceFolder);
-            _logger.LogInformation("Output folder: {OutputFolder}", outputFolder);
+            _logger.LogInformation("Starting {Language} reverse engineering. Source: {SourceFolder}; output: {OutputFolder}",
+                _sourceDiscovery.Language, sourceFolder, outputFolder);
+            var runId = existingRunId ?? 0;
+            if (!existingRunId.HasValue && _migrationRepository is not null)
+                runId = await _migrationRepository.StartRunAsync(sourceFolder, outputFolder, cancellationToken);
 
-            // Create run if needed
-            int runId = existingRunId ?? 0;
-            if (!existingRunId.HasValue && _migrationRepository != null)
+            await LoadGlossaryAsync(cancellationToken);
+            const int totalSteps = 4;
+
+            _enhancedLogger.ShowStep(1, totalSteps, "File Discovery", $"Scanning for {_sourceDiscovery.Language} files");
+            progressCallback?.Invoke("Discovering source files", 1, totalSteps);
+            var sourceFiles = await _sourceDiscovery.DiscoverAsync(sourceFolder, cancellationToken);
+            result.TotalFilesAnalyzed = sourceFiles.Count;
+            if (sourceFiles.Count == 0)
             {
-                runId = await _migrationRepository.StartRunAsync(cobolSourceFolder, outputFolder);
-                _logger.LogInformation("Started new run ID: {RunId}", runId);
-            }
-
-            // Load glossary if available
-            await LoadGlossaryAsync();
-
-            var totalSteps = 4;
-
-            // Step 1: Scan for COBOL files
-            _enhancedLogger.ShowStep(1, totalSteps, "File Discovery", "Scanning for COBOL files");
-            progressCallback?.Invoke("Scanning for COBOL files", 1, totalSteps);
-
-            var cobolFiles = await _fileHelper.ScanDirectoryForCobolFilesAsync(cobolSourceFolder);
-            PromptLoader.CodebaseProfile = PromptLoader.GenerateCodebaseProfile(cobolFiles);
-            _enhancedLogger.ShowSuccess($"Found {cobolFiles.Count} COBOL files");
-            _logger.LogInformation("Found {Count} COBOL files", cobolFiles.Count);
-
-            result.TotalFilesAnalyzed = cobolFiles.Count;
-
-            if (cobolFiles.Count == 0)
-            {
-                _enhancedLogger.ShowWarning("No COBOL files found. Nothing to reverse engineer.");
+                _enhancedLogger.ShowWarning($"No {_sourceDiscovery.Language} files found. Nothing to reverse engineer.");
                 return result;
             }
+            if (_sourceFilePersistence is not null && runId > 0)
+                await _sourceFilePersistence.SaveSourceFilesAsync(runId, sourceFiles, cancellationToken);
 
-            if (_migrationRepository != null && runId > 0)
-            {
-                await _migrationRepository.SaveCobolFilesAsync(runId, cobolFiles);
-            }
+            _enhancedLogger.ShowStep(2, totalSteps, "Technical Analysis", "Running deterministic source analysis");
+            progressCallback?.Invoke("Analyzing source structure", 2, totalSteps);
+            var analyses = await _sourceAnalyzer.AnalyzeAsync(
+                sourceFiles,
+                (processed, total) => _enhancedLogger.ShowProgressBar(processed, total, "files analyzed"),
+                cancellationToken);
+            result.TechnicalAnalyses = analyses.ToList();
 
-            // Step 2: Analyze COBOL structure
-            _enhancedLogger.ShowStep(2, totalSteps, "Technical Analysis", "Analyzing COBOL code structure");
-            progressCallback?.Invoke("Analyzing COBOL structure", 2, totalSteps);
-
-            var analyses = await _cobolAnalyzerAgent.AnalyzeCobolFilesAsync(
-                cobolFiles,
-                (processed, total) => _enhancedLogger.ShowProgressBar(processed, total, "files analyzed"));
-
-            _enhancedLogger.ShowSuccess($"Completed technical analysis of {analyses.Count} files");
-            result.TechnicalAnalyses = analyses;
-
-            // Step 3: Extract business logic
             _enhancedLogger.ShowStep(3, totalSteps, "Business Logic Extraction", "Extracting feature descriptions and use cases");
             progressCallback?.Invoke("Extracting business logic", 3, totalSteps);
-
-            var businessLogicList = await _businessLogicExtractorAgent.ExtractBusinessLogicAsync(
-                cobolFiles,
+            var businessLogic = await _businessLogicExtractor.ExtractAsync(
+                sourceFiles,
                 analyses,
                 _glossary,
-                (processed, total) => _enhancedLogger.ShowProgressBar(processed, total, "files processed"));
+                (processed, total) => _enhancedLogger.ShowProgressBar(processed, total, "files processed"),
+                cancellationToken);
+            result.BusinessLogicExtracts = businessLogic.ToList();
+            result.TotalUserStories = businessLogic.Sum(item => item.UserStories.Count);
+            result.TotalFeatures = businessLogic.Sum(item => item.Features.Count);
+            result.TotalBusinessRules = businessLogic.Sum(item => item.BusinessRules.Count);
 
-            _enhancedLogger.ShowSuccess($"Extracted business logic from {businessLogicList.Count} files");
-            result.BusinessLogicExtracts = businessLogicList;
+            _enhancedLogger.ShowStep(4, totalSteps, "Dependency Mapping", "Mapping statically detectable dependencies");
+            progressCallback?.Invoke("Mapping dependencies", 4, totalSteps);
+            var dependencyMap = await _dependencyAnalyzer.AnalyzeAsync(sourceFiles, analyses, cancellationToken);
+            result.DependencyMap = dependencyMap;
+            _enhancedLogger.ShowSuccess($"Dependency analysis complete - {dependencyMap.Dependencies.Count} relationships found");
 
-            // Calculate totals
-            result.TotalUserStories = businessLogicList.Sum(bl => bl.UserStories.Count);
-            result.TotalFeatures = businessLogicList.Sum(bl => bl.Features.Count);
-            result.TotalBusinessRules = businessLogicList.Sum(bl => bl.BusinessRules.Count);
-
-            // Persist for --reuse-re
-            if (_migrationRepository != null && runId > 0)
+            if (_migrationRepository is not null && runId > 0)
             {
-                await _migrationRepository.SaveBusinessLogicAsync(runId, businessLogicList);
+                await _migrationRepository.SaveBusinessLogicAsync(runId, businessLogic, cancellationToken);
+                await _migrationRepository.SaveDependencyMapAsync(runId, dependencyMap, cancellationToken);
                 result.RunId = runId;
             }
 
-            // Step 4: Map dependencies
-            _enhancedLogger.ShowStep(4, totalSteps, "Dependency Mapping", "Analyzing inter-program dependencies and copybook usage");
-            progressCallback?.Invoke("Mapping dependencies", 4, totalSteps);
-
-            var dependencyMap = await _dependencyMapperAgent.AnalyzeDependenciesAsync(cobolFiles, analyses);
-            _enhancedLogger.ShowSuccess($"Dependency analysis complete - {dependencyMap.Dependencies.Count} relationships found");
-            result.DependencyMap = dependencyMap;
-
-            if (_migrationRepository != null && runId > 0)
-            {
-                await _migrationRepository.SaveDependencyMapAsync(runId, dependencyMap);
-            }
-
-            // Generate output files
-            _logger.LogInformation("Generating documentation...");
-            Console.WriteLine("📝 Generating documentation...");
-            await GenerateOutputAsync(outputFolder, result, dependencyMap);
-
-            _enhancedLogger.ShowSuccess("✓ Reverse engineering complete!");
-            _logger.LogInformation("Output location: {OutputFolder}", outputFolder);
-            Console.WriteLine($"📂 Output location: {outputFolder}");
-
-            if (_migrationRepository != null && runId > 0 && !existingRunId.HasValue)
-            {
-                await _migrationRepository.CompleteRunAsync(runId, "Completed", "Reverse Engineering Only");
-            }
+            await GenerateOutputAsync(outputFolder, result, cancellationToken);
+            if (_migrationRepository is not null && runId > 0 && !existingRunId.HasValue)
+                await _migrationRepository.CompleteRunAsync(runId, "Completed", "Reverse Engineering Only", cancellationToken);
 
             result.Success = true;
             result.OutputFolder = outputFolder;
-
+            _enhancedLogger.ShowSuccess("Reverse engineering complete!");
             return result;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error during reverse engineering process");
             _enhancedLogger.ShowError($"Reverse engineering failed: {ex.Message}");
-            result.Success = false;
             result.ErrorMessage = ex.Message;
             throw;
         }
     }
 
-    private async Task LoadGlossaryAsync()
+    private async Task LoadGlossaryAsync(CancellationToken cancellationToken)
     {
-        try
-        {
-            // Try to load glossary if it exists
-            var glossaryPath = Path.Combine(Directory.GetCurrentDirectory(), "Data", "glossary.json");
-            if (File.Exists(glossaryPath)) 
-            {
-                // Simple implementation since FileHelper.LoadGlossaryAsync might not exist or be accessible
-                // If FileHelper has LoadGlossaryAsync, use it. Assuming it does based on _fileHelper usage.
-                _glossary = await _fileHelper.LoadGlossaryAsync();
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to load glossary file");
-        }
+        var glossaryPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Data", "glossary.json");
+        if (!File.Exists(glossaryPath))
+            return;
+
+        await using var stream = File.OpenRead(glossaryPath);
+        _glossary = await JsonSerializer.DeserializeAsync<Glossary>(stream,
+            new JsonSerializerOptions { PropertyNameCaseInsensitive = true },
+            cancellationToken);
     }
 
-    private async Task GenerateOutputAsync(string outputFolder, ReverseEngineeringResult result, DependencyMap? dependencyMap = null)
+    private async Task GenerateOutputAsync(string outputFolder, ReverseEngineeringResult result, CancellationToken cancellationToken)
     {
         Directory.CreateDirectory(outputFolder);
-
-        // Generate single unified reverse-engineering-details.md
-        var content = GenerateReverseEngineeringDetailsMarkdown(result);
-        var outputPath = Path.Combine(outputFolder, "reverse-engineering-details.md");
-        await File.WriteAllTextAsync(outputPath, content);
-        _logger.LogInformation("Generated reverse engineering documentation: {Path}", outputPath);
-
-        if (dependencyMap != null)
+        await File.WriteAllTextAsync(
+            Path.Combine(outputFolder, "reverse-engineering-details.md"),
+            GenerateReverseEngineeringDetailsMarkdown(result),
+            cancellationToken);
+        if (result.DependencyMap is not null)
         {
-            await _fileHelper.SaveDependencyOutputsAsync(dependencyMap, outputFolder);
-            _logger.LogInformation("Generated dependency map in: {Folder}", outputFolder);
+            var options = new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+            await File.WriteAllTextAsync(Path.Combine(outputFolder, "dependency-map.json"),
+                JsonSerializer.Serialize(result.DependencyMap, options), cancellationToken);
+            await File.WriteAllTextAsync(Path.Combine(outputFolder, "dependency-diagram.md"),
+                $"# {(_sourceDiscovery.Language == SourceLanguage.Cobol ? "COBOL" : "Source")} Dependency Diagram\n\n```mermaid\n{result.DependencyMap.MermaidDiagram}\n```", cancellationToken);
         }
     }
 
     private string GenerateReverseEngineeringDetailsMarkdown(ReverseEngineeringResult result)
     {
-        var sb = new System.Text.StringBuilder();
-
-        // Calculate program vs copybook counts
-        var programCount = result.BusinessLogicExtracts.Count(bl => !bl.IsCopybook);
-        var copybookCount = result.BusinessLogicExtracts.Count(bl => bl.IsCopybook);
-
-        sb.AppendLine("# Reverse Engineering Details");
-        sb.AppendLine();
-        sb.AppendLine($"**Generated**: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-        sb.AppendLine($"**Total Files Analyzed**: {result.TotalFilesAnalyzed} ({programCount} programs, {copybookCount} copybooks)");
-        BusinessLogicMarkdownFormatter.AppendTotals(
-            sb,
-            result.TotalUserStories,
-            result.TotalFeatures,
-            result.TotalBusinessRules);
-        sb.AppendLine();
-        sb.AppendLine("---");
-        sb.AppendLine();
-        sb.AppendLine("## Business Logic");
-        sb.AppendLine();
-
+        var builder = new StringBuilder();
+        var programCount = result.BusinessLogicExtracts.Count(item => !item.IsCopybook);
+        var supportFileCount = result.BusinessLogicExtracts.Count(item => item.IsCopybook);
+        builder.AppendLine("# Reverse Engineering Details");
+        builder.AppendLine();
+        builder.AppendLine($"**Generated**: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        var supportFileLabel = _sourceDiscovery.Language == SourceLanguage.Cobol ? "copybooks" : "support files";
+        builder.AppendLine($"**Total Files Analyzed**: {result.TotalFilesAnalyzed} ({programCount} programs, {supportFileCount} {supportFileLabel})");
+        BusinessLogicMarkdownFormatter.AppendTotals(builder, result.TotalUserStories, result.TotalFeatures, result.TotalBusinessRules);
+        builder.AppendLine();
+        builder.AppendLine("---");
+        builder.AppendLine();
+        builder.AppendLine("## Business Logic");
+        builder.AppendLine();
         foreach (var businessLogic in result.BusinessLogicExtracts)
         {
             var fileTypeLabel = businessLogic.IsCopybook ? " [Copybook]" : "";
-            sb.AppendLine($"## {businessLogic.FileName}{fileTypeLabel}");
-            sb.AppendLine();
-
+            builder.AppendLine($"## {businessLogic.FileName}{fileTypeLabel}");
+            builder.AppendLine();
             if (!string.IsNullOrWhiteSpace(businessLogic.BusinessPurpose))
             {
-                sb.AppendLine("### Business Purpose");
-                sb.AppendLine(businessLogic.BusinessPurpose);
-                sb.AppendLine();
+                builder.AppendLine("### Business Purpose");
+                builder.AppendLine(businessLogic.BusinessPurpose);
+                builder.AppendLine();
             }
-
-            BusinessLogicMarkdownFormatter.AppendUserStories(sb, businessLogic);
-
-            // Features
+            BusinessLogicMarkdownFormatter.AppendUserStories(builder, businessLogic);
             if (businessLogic.Features.Any())
             {
-                sb.AppendLine("### Features");
-                sb.AppendLine();
-
+                builder.AppendLine("### Features");
+                builder.AppendLine();
                 foreach (var feature in businessLogic.Features)
                 {
-                    sb.AppendLine($"#### {feature.Id}: {feature.Name}");
-                    sb.AppendLine();
+                    builder.AppendLine($"#### {feature.Id}: {feature.Name}");
+                    builder.AppendLine();
                     if (!string.IsNullOrWhiteSpace(feature.Description))
-                    {
-                        sb.AppendLine($"**Description:** {feature.Description}");
-                        sb.AppendLine();
-                    }
-
+                        builder.AppendLine($"**Description:** {feature.Description}\n");
                     if (feature.BusinessRules.Any())
-                    {
-                        sb.AppendLine("**Business Rules:**");
-                        foreach (var rule in feature.BusinessRules)
-                        {
-                            sb.AppendLine($"- {rule}");
-                        }
-                        sb.AppendLine();
-                    }
-
+                        builder.AppendLine($"**Business Rules:**\n{string.Join("\n", feature.BusinessRules.Select(rule => $"- {rule}"))}\n");
                     if (feature.Inputs.Any())
-                    {
-                        sb.AppendLine("**Inputs:**");
-                        foreach (var input in feature.Inputs)
-                        {
-                            sb.AppendLine($"- {input}");
-                        }
-                        sb.AppendLine();
-                    }
-
+                        builder.AppendLine($"**Inputs:**\n{string.Join("\n", feature.Inputs.Select(input => $"- {input}"))}\n");
                     if (feature.Outputs.Any())
-                    {
-                        sb.AppendLine("**Outputs:**");
-                        foreach (var output in feature.Outputs)
-                        {
-                            sb.AppendLine($"- {output}");
-                        }
-                        sb.AppendLine();
-                    }
-
+                        builder.AppendLine($"**Outputs:**\n{string.Join("\n", feature.Outputs.Select(output => $"- {output}"))}\n");
                     if (feature.ProcessingSteps.Any())
                     {
-                        sb.AppendLine("**Processing Steps:**");
-                        for (int i = 0; i < feature.ProcessingSteps.Count; i++)
-                        {
-                            sb.AppendLine($"{i + 1}. {feature.ProcessingSteps[i]}");
-                        }
-                        sb.AppendLine();
+                        builder.AppendLine("**Processing Steps:**");
+                        for (var index = 0; index < feature.ProcessingSteps.Count; index++)
+                            builder.AppendLine($"{index + 1}. {feature.ProcessingSteps[index]}");
+                        builder.AppendLine();
                     }
-
                     if (!string.IsNullOrWhiteSpace(feature.SourceLocation))
-                    {
-                        sb.AppendLine($"*Source: {feature.SourceLocation}*");
-                        sb.AppendLine();
-                    }
+                        builder.AppendLine($"*Source: {feature.SourceLocation}*\n");
                 }
             }
-
-            BusinessLogicMarkdownFormatter.AppendBusinessRules(sb, businessLogic);
-
-            sb.AppendLine("---");
-            sb.AppendLine();
+            BusinessLogicMarkdownFormatter.AppendBusinessRules(builder, businessLogic);
+            builder.AppendLine("---");
+            builder.AppendLine();
         }
-
-        // Add technical analysis section
-        sb.AppendLine("---");
-        sb.AppendLine();
-        sb.AppendLine("## Technical Analysis");
-        sb.AppendLine();
-        foreach (var analysis in result.TechnicalAnalyses)
-        {
-            var fileTypeLabel = analysis.IsCopybook ? " [Copybook]" : "";
-            sb.AppendLine($"### {analysis.FileName}{fileTypeLabel}");
-            sb.AppendLine();
-
-            if (!string.IsNullOrWhiteSpace(analysis.ProgramDescription))
-            {
-                sb.AppendLine($"**Program Description:** {analysis.ProgramDescription}");
-                sb.AppendLine();
-            }
-
-            if (analysis.DataDivisions.Any())
-            {
-                sb.AppendLine("**Data Divisions:**");
-                foreach (var div in analysis.DataDivisions)
-                {
-                    sb.AppendLine($"- {div}");
-                }
-                sb.AppendLine();
-            }
-
-            if (analysis.ProcedureDivisions.Any())
-            {
-                sb.AppendLine("**Procedure Divisions:**");
-                foreach (var div in analysis.ProcedureDivisions)
-                {
-                    sb.AppendLine($"- {div}");
-                }
-                sb.AppendLine();
-            }
-
-            if (analysis.CopybooksReferenced.Any())
-            {
-                sb.AppendLine("**Copybooks Referenced:**");
-                foreach (var copybook in analysis.CopybooksReferenced)
-                {
-                    sb.AppendLine($"- {copybook}");
-                }
-                sb.AppendLine();
-            }
-
-            // Fall back to raw AI response when structured fields were not parsed
-            bool hasStructuredData = analysis.DataDivisions.Any() || analysis.ProcedureDivisions.Any()
-                || analysis.CopybooksReferenced.Any() || analysis.Paragraphs.Any();
-            if (!hasStructuredData && !string.IsNullOrWhiteSpace(analysis.RawAnalysisData))
-            {
-                sb.AppendLine(analysis.RawAnalysisData);
-                sb.AppendLine();
-            }
-
-            sb.AppendLine("---");
-            sb.AppendLine();
-        }
-
-        return sb.ToString();
+        _reportFormatter.AppendTechnicalAnalysis(builder, result.TechnicalAnalyses);
+        return builder.ToString();
     }
 }
 
-/// <summary>
-/// Result of the reverse engineering process.
-/// </summary>
 public class ReverseEngineeringResult
 {
     public bool Success { get; set; }
@@ -399,7 +238,7 @@ public class ReverseEngineeringResult
     public int TotalFeatures { get; set; }
     public int TotalBusinessRules { get; set; }
     public int TotalModernizationOpportunities { get; set; }
-    public List<CobolAnalysis> TechnicalAnalyses { get; set; } = new List<CobolAnalysis>();
-    public List<BusinessLogic> BusinessLogicExtracts { get; set; } = new List<BusinessLogic>();
+    public List<Models.SourceAnalysis> TechnicalAnalyses { get; set; } = new();
+    public List<BusinessLogic> BusinessLogicExtracts { get; set; } = new();
     public DependencyMap? DependencyMap { get; set; }
 }

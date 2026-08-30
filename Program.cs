@@ -54,7 +54,7 @@ internal static class Program
             var fileHelper = new FileHelper(loggerFactory.CreateLogger<FileHelper>());
             var settingsHelper = new SettingsHelper(loggerFactory.CreateLogger<SettingsHelper>());
 
-            if (!ValidateAndLoadConfiguration())
+            if (!IsDeterministicCSharpReverseEngineering(args) && !ValidateAndLoadConfiguration())
             {
                 return 1;
             }
@@ -62,6 +62,7 @@ internal static class Program
             var rootCommand = BuildRootCommand(loggerFactory, logger, fileHelper, settingsHelper);
             return await rootCommand.InvokeAsync(args);
         }
+
         finally
         {
             // Stop live logging and restore console
@@ -70,6 +71,25 @@ internal static class Program
                 LiveLogWriter.Stop();
             }
         }
+    }
+
+    private static bool IsDeterministicCSharpReverseEngineering(string[] args)
+    {
+        if (!args.Contains("reverse-engineer", StringComparer.OrdinalIgnoreCase) ||
+            args.Contains("--extract-business-logic", StringComparer.OrdinalIgnoreCase))
+            return false;
+
+        for (var index = 0; index < args.Length; index++)
+        {
+            var argument = args[index];
+            if (argument.Equals("--source-language=CSharp", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (argument.Equals("--source-language", StringComparison.OrdinalIgnoreCase) &&
+                index + 1 < args.Length &&
+                args[index + 1].Equals("CSharp", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
     }
 
     private static RootCommand BuildRootCommand(ILoggerFactory loggerFactory, ILogger logger, FileHelper fileHelper, SettingsHelper settingsHelper)
@@ -239,10 +259,18 @@ internal static class Program
         configOption.AddAlias("-c");
         reverseEngineerCommand.AddOption(configOption);
 
-        reverseEngineerCommand.SetHandler(async (string cobolSource, string output, string configPath) =>
+        var sourceLanguageOption = new Option<SourceLanguage>("--source-language", () => SourceLanguage.Cobol,
+            "Source language to analyze (Cobol or CSharp)");
+        reverseEngineerCommand.AddOption(sourceLanguageOption);
+
+        var extractBusinessLogicOption = new Option<bool>("--extract-business-logic",
+            "For C#, generate grounded business documentation with the configured AI provider after deterministic analysis.");
+        reverseEngineerCommand.AddOption(extractBusinessLogicOption);
+
+        reverseEngineerCommand.SetHandler(async (string cobolSource, string output, string configPath, SourceLanguage sourceLanguage, bool extractBusinessLogic) =>
         {
-            await RunReverseEngineeringAsync(loggerFactory, fileHelper, settingsHelper, cobolSource, output, configPath);
-        }, cobolSourceOption, outputOption, configOption);
+            await RunReverseEngineeringAsync(loggerFactory, fileHelper, settingsHelper, cobolSource, output, configPath, sourceLanguage, extractBusinessLogic);
+        }, cobolSourceOption, outputOption, configOption, sourceLanguageOption, extractBusinessLogicOption);
 
         return reverseEngineerCommand;
     }
@@ -710,13 +738,15 @@ internal static class Program
                     Console.WriteLine("⚡ All files below chunking threshold - using direct reverse engineering");
 
                     var reverseEngineeringProcess = new ReverseEngineeringProcess(
-                        cobolAnalyzerAgent,
-                        businessLogicExtractorAgent,
-                        dependencyMapperAgent,
-                        fileHelper,
+                        new SourceAnalysis.Cobol.CobolSourceDiscovery(fileHelper),
+                        new SourceAnalysis.Cobol.CobolSourceAnalyzer(cobolAnalyzerAgent),
+                        new SourceAnalysis.Cobol.CobolBusinessLogicExtractor(businessLogicExtractorAgent),
+                        new SourceAnalysis.Cobol.CobolDependencyAnalyzer(dependencyMapperAgent),
+                        new SourceAnalysis.Cobol.CobolAnalysisReportFormatter(),
                         loggerFactory.CreateLogger<ReverseEngineeringProcess>(),
                         enhancedLogger,
-                        migrationRepository);
+                        migrationRepository,
+                        new SourceAnalysis.Cobol.CobolSourceFilePersistence(migrationRepository));
 
                     reverseEngResult = await reverseEngineeringProcess.RunAsync(
                         settings.ApplicationSettings.CobolSourceFolder,
@@ -1419,7 +1449,7 @@ internal static class Program
         return serviceType.Equals("GitHubCopilotSDK", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static async Task RunReverseEngineeringAsync(ILoggerFactory loggerFactory, FileHelper fileHelper, SettingsHelper settingsHelper, string cobolSource, string output, string configPath)
+    private static async Task RunReverseEngineeringAsync(ILoggerFactory loggerFactory, FileHelper fileHelper, SettingsHelper settingsHelper, string cobolSource, string output, string configPath, SourceLanguage sourceLanguage, bool extractBusinessLogic)
     {
         var logger = loggerFactory.CreateLogger("ReverseEngineering");
 
@@ -1447,6 +1477,47 @@ internal static class Program
             if (!string.IsNullOrEmpty(cobolSource))
             {
                 settings.ApplicationSettings.CobolSourceFolder = cobolSource;
+            }
+
+            if (sourceLanguage == SourceLanguage.CSharp && !extractBusinessLogic)
+            {
+                var csharpEnhancedLogger = new EnhancedLogger(loggerFactory.CreateLogger<EnhancedLogger>());
+                IMigrationRepository analysisRepository = migrationRepository;
+                if (settings.ApplicationSettings.Neo4j?.Enabled == true)
+                {
+                    try
+                    {
+                        var neo4jDriver = Neo4j.Driver.GraphDatabase.Driver(
+                            settings.ApplicationSettings.Neo4j.Uri,
+                            Neo4j.Driver.AuthTokens.Basic(
+                                settings.ApplicationSettings.Neo4j.Username,
+                                settings.ApplicationSettings.Neo4j.Password));
+                        analysisRepository = new HybridMigrationRepository(
+                            migrationRepository,
+                            new Neo4jMigrationRepository(neo4jDriver, loggerFactory.CreateLogger<Neo4jMigrationRepository>()),
+                            loggerFactory.CreateLogger<HybridMigrationRepository>());
+                        await analysisRepository.InitializeAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning(ex, "Failed to connect to Neo4j; C# analysis will persist to SQLite only.");
+                    }
+                }
+                var reverseEngineeringProcess = new ReverseEngineeringProcess(
+                    new SourceAnalysis.CSharp.CSharpSourceDiscovery(),
+                    new SourceAnalysis.CSharp.CSharpSourceAnalyzer(loggerFactory.CreateLogger<SourceAnalysis.CSharp.CSharpSourceAnalyzer>()),
+                    new SourceAnalysis.NoOpBusinessLogicExtractor(SourceLanguage.CSharp),
+                    new SourceAnalysis.CSharp.CSharpDependencyAnalyzer(),
+                    new SourceAnalysis.DefaultSourceAnalysisReportFormatter(),
+                    loggerFactory.CreateLogger<ReverseEngineeringProcess>(),
+                    csharpEnhancedLogger,
+                    analysisRepository);
+                var csharpResult = await reverseEngineeringProcess.RunAsync(
+                    settings.ApplicationSettings.CobolSourceFolder,
+                    output,
+                    (status, current, total) => Console.WriteLine($"{status} - {current}/{total}"));
+                Console.WriteLine($"C# reverse engineering completed: {csharpResult.TotalFilesAnalyzed} files, {csharpResult.DependencyMap?.Dependencies.Count ?? 0} relationships.");
+                return;
             }
 
             if (string.IsNullOrEmpty(settings.ApplicationSettings.CobolSourceFolder))
@@ -1504,6 +1575,32 @@ internal static class Program
 
             var providerName = codeClient is Agents.Infrastructure.CopilotChatClient ? "GitHub Copilot" : "Azure OpenAI";
             var chatLogger = new ChatLogger(loggerFactory.CreateLogger<ChatLogger>(), providerName: providerName);
+
+            if (sourceLanguage == SourceLanguage.CSharp)
+            {
+                var csharpBusinessLogicExtractorAgent = BusinessLogicExtractorAgent.Create(
+                    null, chatClient,
+                    loggerFactory.CreateLogger<BusinessLogicExtractorAgent>(),
+                    settings.AISettings.ChatModelId ?? chatDeployment,
+                    enhancedLogger, chatLogger, settings: settings);
+                var reverseEngineeringProcess = new ReverseEngineeringProcess(
+                    new SourceAnalysis.CSharp.CSharpSourceDiscovery(),
+                    new SourceAnalysis.CSharp.CSharpSourceAnalyzer(loggerFactory.CreateLogger<SourceAnalysis.CSharp.CSharpSourceAnalyzer>()),
+                    new SourceAnalysis.CSharp.CSharpBusinessLogicExtractor(
+                        csharpBusinessLogicExtractorAgent,
+                        settings.ChunkingSettings.MaxParallelAnalysis),
+                    new SourceAnalysis.CSharp.CSharpDependencyAnalyzer(),
+                    new SourceAnalysis.DefaultSourceAnalysisReportFormatter(),
+                    loggerFactory.CreateLogger<ReverseEngineeringProcess>(),
+                    enhancedLogger,
+                    migrationRepository);
+                var csharpResult = await reverseEngineeringProcess.RunAsync(
+                    settings.ApplicationSettings.CobolSourceFolder,
+                    output,
+                    (status, current, total) => Console.WriteLine($"{status} - {current}/{total}"));
+                Console.WriteLine($"C# reverse engineering completed: {csharpResult.TotalFilesAnalyzed} files, {csharpResult.TotalBusinessRules} business rules, {csharpResult.DependencyMap?.Dependencies.Count ?? 0} relationships.");
+                return;
+            }
 
             ConfigureSmartChunking(settings, chatDeployment, logger);
 
@@ -1571,13 +1668,15 @@ internal static class Program
             {
                 // Use standard ReverseEngineeringProcess with agents
                 var reverseEngineeringProcess = new ReverseEngineeringProcess(
-                    cobolAnalyzerAgent,
-                    businessLogicExtractorAgent,
-                    dependencyMapperAgent,
-                    fileHelper,
+                    new SourceAnalysis.Cobol.CobolSourceDiscovery(fileHelper),
+                    new SourceAnalysis.Cobol.CobolSourceAnalyzer(cobolAnalyzerAgent),
+                    new SourceAnalysis.Cobol.CobolBusinessLogicExtractor(businessLogicExtractorAgent),
+                    new SourceAnalysis.Cobol.CobolDependencyAnalyzer(dependencyMapperAgent),
+                    new SourceAnalysis.Cobol.CobolAnalysisReportFormatter(),
                     loggerFactory.CreateLogger<ReverseEngineeringProcess>(),
                     enhancedLogger,
-                    migrationRepository);
+                    migrationRepository,
+                    new SourceAnalysis.Cobol.CobolSourceFilePersistence(migrationRepository));
 
                 Console.WriteLine("Starting reverse engineering process...");
                 Console.WriteLine();

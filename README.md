@@ -199,6 +199,12 @@ dotnet build
 ./doctor.sh convert-only  # Conversion only; prompts to reuse persisted RE context
 ```
 
+### Deterministic C# source analysis
+
+The standalone reverse-engineering command also analyzes C# solutions without
+using an LLM. See [Source language analysis](docs/source-language-analysis.md)
+for the command, extracted facts, graph mapping, and static-analysis limits.
+
 #### Business Logic Persistence and --reuse-re
 
 After every `reverse-eng` or full `run`, extracted business logic is persisted to the SQLite database. This enables three distinct conversion modes:
@@ -1100,7 +1106,9 @@ See [Parallel Jobs Formula](#parallel-jobs-formula) for chunking configuration d
 
 - [Smart Chunking & Token Architecture](docs/smart-chunking-architecture.md) - Full diagrams, constants reference, and complexity scoring details
 - [Smart Chunking Guide](docs/smart-chunking-deep-dive.md) - Deep technical details
-- [Architecture Documentation](docs/REVERSE_ENGINEERING_ARCHITECTURE.md) - System design
+- [Current Source Analysis Architecture](docs/current-source-analysis-architecture.md) - Current neutral, COBOL, C#, reporting, and persistence design
+- [Discovery Factory Gap Analysis](docs/discovery-factory-gap-analysis.md) - Fit assessment, critical gaps, and relational/graph storage direction
+- [COBOL Reverse Engineering Architecture](docs/REVERSE_ENGINEERING_ARCHITECTURE.md) - COBOL smart-chunking design
 - [Speed Profiles](docs/speed-profiles.md) - TURBO/FAST/BALANCED/THOROUGH env var overrides and complexity scoring
 - [Azure AD / Entra ID Authentication Guide](docs/az-login-auth-guide.md) - Keyless auth setup
 - [Changelog](CHANGELOG.md) - Version history

@@ -294,11 +294,53 @@ CREATE TABLE IF NOT EXISTS business_logic (
     business_rules_json TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE,
-    UNIQUE(run_id, file_name)
+    UNIQUE(run_id, file_path)
 );
 CREATE INDEX IF NOT EXISTS idx_business_logic_run ON business_logic(run_id);";
         await command.ExecuteNonQueryAsync(cancellationToken);
+        await MigrateBusinessLogicIdentityAsync(connection, cancellationToken);
         _logger.LogInformation("SQLite database ready at {DatabasePath}", _databasePath);
+    }
+
+    private static async Task MigrateBusinessLogicIdentityAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        await using var schemaCommand = connection.CreateCommand();
+        schemaCommand.CommandText = "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'business_logic'";
+        var schema = (string?)await schemaCommand.ExecuteScalarAsync(cancellationToken);
+        if (schema is null || !schema.Contains("UNIQUE(run_id, file_name)", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        await using var migrationCommand = connection.CreateCommand();
+        migrationCommand.Transaction = (SqliteTransaction)transaction;
+        migrationCommand.CommandText = """
+            ALTER TABLE business_logic RENAME TO business_logic_legacy;
+            CREATE TABLE business_logic (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                file_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                is_copybook INTEGER NOT NULL DEFAULT 0,
+                business_purpose TEXT,
+                user_stories_json TEXT,
+                features_json TEXT,
+                business_rules_json TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE,
+                UNIQUE(run_id, file_path)
+            );
+            INSERT INTO business_logic (
+                id, run_id, file_name, file_path, is_copybook, business_purpose,
+                user_stories_json, features_json, business_rules_json, created_at)
+            SELECT
+                id, run_id, file_name, file_path, is_copybook, business_purpose,
+                user_stories_json, features_json, business_rules_json, created_at
+            FROM business_logic_legacy;
+            DROP TABLE business_logic_legacy;
+            CREATE INDEX IF NOT EXISTS idx_business_logic_run ON business_logic(run_id);
+            """;
+        await migrationCommand.ExecuteNonQueryAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
     }
 
     public async Task CleanupStaleRunsAsync(CancellationToken cancellationToken = default)
