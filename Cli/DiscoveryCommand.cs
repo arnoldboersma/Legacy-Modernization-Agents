@@ -28,7 +28,9 @@ public static class DiscoveryCommand
         root.AddCommand(BuildClassifyRolesCommand(loggerFactory));
         root.AddCommand(BuildGraphCommand(loggerFactory));
         root.AddCommand(BuildSeedContextsCommand(loggerFactory));
+        root.AddCommand(BuildClassifyIntegrationsCommand(loggerFactory));
         root.AddCommand(BuildExportCommand(loggerFactory));
+        root.AddCommand(BuildExportIntegrationsCommand(loggerFactory));
 
         return root;
     }
@@ -439,6 +441,134 @@ public static class DiscoveryCommand
         return cmd;
     }
 
+    private static Command BuildClassifyIntegrationsCommand(ILoggerFactory loggerFactory)
+    {
+        var cmd = new Command("classify-integrations",
+            "Deterministically inventory statically observable integrations (HTTP/API, messaging, files, " +
+            "databases/shared stores, identity/authorization, notifications, service discovery/platform " +
+            "config, observability, scheduled/background processes) under --source-dir, classified as " +
+            "runtime application, platform/identity, observability, or delivery (design doc §7, issue #6). " +
+            "Best-effort links each integration to a Phase 5 candidate context when the source is already " +
+            "graphed and context-seeded on the same run.");
+
+        var runIdOption = new Option<string?>("--run-id", "Existing run to append to. If omitted, a new run is declared automatically.");
+        cmd.AddOption(runIdOption);
+
+        var sourceDirOption = new Option<string>("--source-dir", "Directory containing the C# project source to inventory (e.g. a PlanBoard project directory). Scanned recursively; bin/obj are always excluded.") { IsRequired = true };
+        cmd.AddOption(sourceDirOption);
+
+        var databaseOption = new Option<string>("--database", () => DefaultDatabasePath, "Path to the Discovery Factory SQLite database.");
+        cmd.AddOption(databaseOption);
+
+        cmd.SetHandler(async (string? runId, string sourceDir, string database) =>
+        {
+            var repository = CreateRepository(loggerFactory, database);
+            var service = new DiscoveryService(repository, loggerFactory.CreateLogger<DiscoveryService>());
+
+            if (!Directory.Exists(sourceDir))
+            {
+                Console.Error.WriteLine($"Source directory not found: {sourceDir}");
+                Environment.ExitCode = 2;
+                return;
+            }
+
+            DiscoveryRun run;
+            if (!string.IsNullOrWhiteSpace(runId))
+            {
+                await repository.InitializeAsync();
+                run = await repository.GetRunAsync(runId)
+                    ?? throw new InvalidOperationException($"Run not found: {runId}");
+            }
+            else
+            {
+                run = await service.StartRunAsync(
+                    subject: "PlanBoard integration inventory (issue #6)",
+                    sourceLocator: Path.GetFullPath(sourceDir),
+                    sourceRevision: "local-working-tree",
+                    inclusions: new[] { sourceDir },
+                    exclusions: new[] { "bin/", "obj/" },
+                    evidenceBoundary: "Static C# source and configuration-key names only (Roslyn syntax-tree parsing); no resolved configuration values, secrets, or runtime logs.");
+            }
+
+            var csFiles = Directory.EnumerateFiles(sourceDir, "*.cs", SearchOption.AllDirectories)
+                .Where(f => !ArtifactRoleClassifier.IsExcludedBuildOutputPath(Path.GetRelativePath(sourceDir, f)))
+                .ToList();
+            var jsonFiles = Directory.EnumerateFiles(sourceDir, "appsettings*.json", SearchOption.AllDirectories)
+                .Where(f => !ArtifactRoleClassifier.IsExcludedBuildOutputPath(Path.GetRelativePath(sourceDir, f)))
+                .ToList();
+
+            // Reuse artifacts already appended by an earlier classify-roles/build-graph pass on the same
+            // run (keyed by path+content hash) so that owning-context linking via graph nodes can resolve.
+            // Only append a fresh artifact record when this run has not already seen this exact content.
+            var existingArtifacts = (await repository.GetArtifactsAsync(run.RunId))
+                .GroupBy(a => (a.Path, a.ContentHash))
+                .ToDictionary(g => g.Key, g => g.First());
+
+            if (csFiles.Count == 0 && jsonFiles.Count == 0)
+            {
+                Console.Error.WriteLine($"No .cs or appsettings*.json files found under {sourceDir}");
+                Environment.ExitCode = 2;
+                return;
+            }
+
+            var candidates = new List<(CobolToQuarkusMigration.Discovery.Integrations.IntegrationCandidate Candidate, string? ArtifactId)>();
+
+            foreach (var file in csFiles)
+            {
+                var content = await File.ReadAllTextAsync(file);
+                var relativePath = Path.GetRelativePath(sourceDir, file);
+                var contentHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(content))).ToLowerInvariant();
+                if (!existingArtifacts.TryGetValue((relativePath, contentHash), out var artifact))
+                {
+                    artifact = await service.AppendArtifactAsync(run.RunId, relativePath, "CSharp", contentHash, content.Length);
+                }
+
+                var classifierFile = new ClassifierSourceFile(relativePath, content);
+                foreach (var candidate in CobolToQuarkusMigration.Discovery.Integrations.IntegrationClassifier.ClassifyProject(new[] { classifierFile }))
+                {
+                    candidates.Add((candidate, artifact.ArtifactId));
+                }
+            }
+
+            foreach (var file in jsonFiles)
+            {
+                var content = await File.ReadAllTextAsync(file);
+                var relativePath = Path.GetRelativePath(sourceDir, file);
+                var contentHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(content))).ToLowerInvariant();
+                if (!existingArtifacts.TryGetValue((relativePath, contentHash), out var artifact))
+                {
+                    artifact = await service.AppendArtifactAsync(run.RunId, relativePath, "Config", contentHash, content.Length);
+                }
+
+                var classifierFile = new ClassifierSourceFile(relativePath, content);
+                foreach (var candidate in CobolToQuarkusMigration.Discovery.Integrations.IntegrationClassifier.ClassifyConfigurationFile(classifierFile))
+                {
+                    candidates.Add((candidate, artifact.ArtifactId));
+                }
+            }
+
+            var integrations = await service.AppendIntegrationsAsync(run.RunId, candidates, producerVersion: "IntegrationClassifier/1.0");
+
+            Console.Out.WriteLine($"Run: {run.RunId}");
+            Console.Out.WriteLine($"Classified {candidates.Count} integration candidate(s) into {integrations.Count} integration record(s).");
+            Console.Out.WriteLine("By classification:");
+            foreach (var group in integrations.GroupBy(i => i.Classification).OrderBy(g => g.Key))
+            {
+                Console.Out.WriteLine($"  {group.Key}: {group.Count()}");
+            }
+            Console.Out.WriteLine("By category:");
+            foreach (var group in integrations.GroupBy(i => i.Category).OrderBy(g => g.Key))
+            {
+                Console.Out.WriteLine($"  {group.Key}: {group.Count()}");
+            }
+            var requiresReviewCount = integrations.Count(i => i.RequiresReview);
+            var linkedCount = integrations.Count(i => i.OwningContextCandidateId is not null);
+            Console.Out.WriteLine($"Requires review: {requiresReviewCount}; linked to a candidate context: {linkedCount}.");
+        }, runIdOption, sourceDirOption, databaseOption);
+
+        return cmd;
+    }
+
     private static Command BuildExportCommand(ILoggerFactory loggerFactory)
     {
         var cmd = new Command("export", "Export a reviewed finding revision to versioned Markdown and JSON.");
@@ -471,6 +601,45 @@ public static class DiscoveryCommand
                 Environment.ExitCode = 2;
             }
         }, findingRevisionOption, outputDirOption, databaseOption);
+
+        return cmd;
+    }
+
+    private static Command BuildExportIntegrationsCommand(ILoggerFactory loggerFactory)
+    {
+        var cmd = new Command("export-integrations",
+            "Export a run's full integration inventory to a single JSON file, grouped by " +
+            "classification (RuntimeApplication/PlatformIdentity/Observability/Delivery) so " +
+            "consumers can distinguish business behavior from platform, observability, and " +
+            "delivery concerns without re-deriving it (design doc §7, issue #6).");
+
+        var runIdOption = new Option<string>("--run-id", "Run whose integration inventory to export.") { IsRequired = true };
+        cmd.AddOption(runIdOption);
+
+        var outputDirOption = new Option<string>("--output-dir", () => "output/discovery", "Directory to write the integration inventory JSON to.");
+        cmd.AddOption(outputDirOption);
+
+        var databaseOption = new Option<string>("--database", () => DefaultDatabasePath, "Path to the Discovery Factory SQLite database.");
+        cmd.AddOption(databaseOption);
+
+        cmd.SetHandler(async (string runId, string outputDir, string database) =>
+        {
+            var repository = CreateRepository(loggerFactory, database);
+            await repository.InitializeAsync();
+            var exporter = new DiscoveryExporter(repository);
+
+            try
+            {
+                var jsonPath = await exporter.ExportIntegrationInventoryAsync(runId, outputDir);
+                Console.Out.WriteLine($"Exported integration inventory for {runId} to:");
+                Console.Out.WriteLine($"  {jsonPath}");
+            }
+            catch (InvalidOperationException ex)
+            {
+                Console.Error.WriteLine(ex.Message);
+                Environment.ExitCode = 2;
+            }
+        }, runIdOption, outputDirOption, databaseOption);
 
         return cmd;
     }

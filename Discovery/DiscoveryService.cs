@@ -700,6 +700,121 @@ public sealed class DiscoveryService
     /// Appends a same-content revision row that only changes status, so status transitions are
     /// themselves append-only records rather than in-place updates on <c>finding_revisions</c>.
     /// </summary>
+    // ---------------------------------------------------------------------------------------
+    // Discovery Factory phase 6 (issue #6): integration inventory and topology links. Reuses
+    // Phase 5 graph nodes/context memberships as an input signal for owning-context resolution
+    // rather than re-deriving context boundaries.
+    // ---------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Persists a set of already-extracted integration candidates (produced by the caller via
+    /// <see cref="Integrations.IntegrationClassifier"/>) with cited evidence and provenance.
+    /// When <paramref name="artifactId"/> resolves to a graph <see cref="DependencyGraphNode"/>
+    /// declared in the same artifact that already has a context membership, the integration is
+    /// linked to that owning <see cref="ContextCandidate"/> (best-effort; unresolved integrations
+    /// remain unlinked rather than being force-fit into a fallback context).
+    /// </summary>
+    public async Task<IReadOnlyList<Integration>> AppendIntegrationsAsync(
+        string runId,
+        IReadOnlyList<(Integrations.IntegrationCandidate Candidate, string? ArtifactId)> candidates,
+        string producerVersion,
+        CancellationToken cancellationToken = default)
+    {
+        var graphNodes = await _repository.GetGraphNodesAsync(runId, cancellationToken);
+        var nodesByArtifact = graphNodes.Where(n => n.ArtifactId is not null)
+            .GroupBy(n => n.ArtifactId!)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        var memberships = await _repository.GetContextMembershipsAsync(runId, cancellationToken);
+        var contextByNodeId = memberships
+            .GroupBy(m => m.NodeId)
+            .ToDictionary(g => g.Key, g => g.First().ContextCandidateId);
+
+        var results = new List<Integration>();
+
+        foreach (var (candidate, artifactId) in candidates)
+        {
+            var evidenceIds = new List<string>();
+            foreach (var citation in candidate.Citations)
+            {
+                var evidence = await AppendEvidenceAsync(runId, EvidenceType.SourceCode, citation.Locator, artifactId,
+                    rawExcerpt: $"[{citation.RuleName}] {citation.Excerpt}", cancellationToken);
+                evidenceIds.Add(evidence.EvidenceId);
+            }
+
+            string? owningContextCandidateId = null;
+            if (artifactId is not null && nodesByArtifact.TryGetValue(artifactId, out var nodesForArtifact))
+            {
+                foreach (var node in nodesForArtifact)
+                {
+                    if (contextByNodeId.TryGetValue(node.NodeId, out var contextId))
+                    {
+                        owningContextCandidateId = contextId;
+                        break;
+                    }
+                }
+            }
+
+            var provenance = new Provenance
+            {
+                ProvenanceId = NewId("PROV"),
+                RunId = runId,
+                ProducerKind = "DeterministicExtractor",
+                ProducerVersion = producerVersion,
+                InputRecordIds = evidenceIds,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+            };
+            await _repository.AppendProvenanceAsync(provenance, cancellationToken);
+
+            var integration = new Integration
+            {
+                IntegrationId = NewId("INTG"),
+                RunId = runId,
+                Category = candidate.Category,
+                Classification = candidate.Classification,
+                Direction = candidate.Direction,
+                TriggerOrCaller = candidate.TriggerOrCaller,
+                ProtocolOrMechanism = candidate.ProtocolOrMechanism,
+                LogicalTarget = candidate.LogicalTarget,
+                ConfigurationKeySemantics = candidate.ConfigurationKeySemantics,
+                RedactedContractShape = candidate.RedactedContractShape,
+                AuthenticationSemantics = candidate.AuthenticationSemantics,
+                ReliabilityBehavior = candidate.ReliabilityBehavior,
+                OwningContextCandidateId = owningContextCandidateId,
+                EvidenceIds = evidenceIds,
+                Confidence = candidate.Confidence,
+                ClassificationRule = candidate.ClassificationRule,
+                BlindSpots = candidate.BlindSpots,
+                RequiresReview = candidate.RequiresReview,
+                ProvenanceId = provenance.ProvenanceId,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+            };
+            await _repository.AppendIntegrationAsync(integration, cancellationToken);
+            results.Add(integration);
+
+            if (owningContextCandidateId is not null)
+            {
+                await _repository.AppendIntegrationLinkAsync(new IntegrationLink
+                {
+                    IntegrationLinkId = NewId("ILNK"),
+                    RunId = runId,
+                    IntegrationId = integration.IntegrationId,
+                    LinkedRecordKind = IntegrationLinkedRecordKind.ContextCandidate,
+                    LinkedRecordId = owningContextCandidateId,
+                    CreatedAtUtc = DateTimeOffset.UtcNow,
+                }, cancellationToken);
+            }
+        }
+
+        return results;
+    }
+
+    public Task<IReadOnlyList<Integration>> GetIntegrationsAsync(string runId, CancellationToken cancellationToken = default)
+        => _repository.GetIntegrationsAsync(runId, cancellationToken);
+
+    public Task<IReadOnlyList<IntegrationLink>> GetIntegrationLinksAsync(string integrationId, CancellationToken cancellationToken = default)
+        => _repository.GetIntegrationLinksAsync(integrationId, cancellationToken);
+
     private async Task AppendStatusOnlyRevisionAsync(
         FindingRevision current,
         ReviewStatus newStatus,

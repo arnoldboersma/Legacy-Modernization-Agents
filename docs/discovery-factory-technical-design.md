@@ -760,3 +760,106 @@ not change the deferred decisions in §12.
     reclassify or publish a context claim on its own).
 
 
+
+- **Phase 6 (issue #6): integration discovery and topology inventory.** Adds a new
+  governed record family, `Integration`/`IntegrationLink`, parallel to `RoleAssignment` and
+  `ContextCandidate` (`Discovery/Models/Integration.cs`,
+  `Discovery/Persistence/Migrations/0004_integrations.sql`,
+  `Discovery/Integrations/IntegrationClassifier.cs`, `DiscoveryService.AppendIntegrationsAsync`,
+  CLI `discovery classify-integrations` / `discovery export-integrations`, portal page
+  `discovery-integrations.html`). An `Integration` is a deterministic *presence fact*
+  (like `RoleAssignment`) rather than a reviewable claim — it has no publish/reject
+  lifecycle, only a `RequiresReview` flag plus a required (possibly empty) `BlindSpots`
+  list used when a rule is not fully authoritative.
+  - **Classification vs. category.** `IntegrationCategory` (`HttpApi`, `Messaging`,
+    `FileImportExport`, `DatabaseOrSharedStore`, `IdentityOrAuthorization`, `Notification`,
+    `ServiceDiscoveryOrPlatformConfig`, `ScheduledOrBackgroundProcess`) records *what kind*
+    of integration was found; `IntegrationClassification` (`RuntimeApplication`,
+    `PlatformIdentity`, `Observability`, `Delivery`) records *what kind of concern* it is,
+    so platform/identity/observability/delivery plumbing is never misrepresented as
+    business runtime behavior in the handoff or JSON export (issue #6 acceptance
+    criterion). The two axes are independent — e.g. `IdentityOrAuthorization` is always
+    `PlatformIdentity`, but `HttpApi` can be `RuntimeApplication` (an application
+    controller/outbound call) or `PlatformIdentity` (a Microsoft Graph client call).
+  - **Authoritative signal sources, following the §14 Phase 4/5 lesson.** Rules key off
+    referenced NuGet package identity / `using` namespace declarations (e.g.
+    `Microsoft.Graph`, `Azure.Identity`, `Microsoft.Identity.Web`,
+    `Azure.Communication.Email`, `Azure.Monitor.OpenTelemetry`, `Aspire.Hosting`), base
+    types/interfaces (`DbContext`, `BackgroundService`/`IHostedService`, controller
+    attributes), and literal configuration-**key** names read from `appsettings*.json`
+    (`ConnectionStrings:*`, `KeyVaultName`, `GetConnectionString("...")` argument) — never
+    resolved configuration values, matching the existing redaction convention. No
+    configuration file is copied into this repository; only its path, content hash, and a
+    cited excerpt of the key name are persisted as `Evidence`, exactly as for `.cs`/
+    `.csproj` artifacts in Phases 4/5.
+  - **Three explicitly flagged, non-authoritative heuristics (documented, not hidden, per
+    the Phase 5 "Shared" precedent and the orchestrator's Q3 confirmation):**
+    1. `BackgroundServiceBaseTypeWithPathBasedDeliverySplit` — a `BackgroundService`/
+       `IHostedService` type is classified `Delivery` instead of `RuntimeApplication` when
+       its file path contains a deploy/migration-shaped project segment (e.g.
+       `*.DatabaseMigration`). This is a project-path/name heuristic, the same risk class
+       as the Phase 5 generic-name issue: a differently-named migration-runner project
+       would not be caught, and a business worker named `...Migration...` for unrelated
+       reasons would be misclassified. Every hit sets `RequiresReview = true` and records
+       this exact limitation in `BlindSpots`.
+    2. `NotificationOrOutboxTypeNameShape` — types are recognized as
+       `Notification`/`Messaging` integrations via a type-name substring match (e.g.
+       `*EmailDeliveryClient`, `*NotificationOutbox*`) rather than an interface/attribute
+       signal, because PlanBoard's notification/outbox abstractions are not defined via a
+       shared framework interface this pilot can key off deterministically. Flagged the
+       same way, with `RequiresReview = true` and an explicit `BlindSpots` entry.
+    3. `HttpClientFactoryOrHttpClientConsumer` (added after an orchestrator review of the
+       real PlanBoard results found all-`Inbound` `HttpApi` records and no outbound calls,
+       even though controllers such as `AvailabilityController` inject
+       `IHttpClientFactory`) — a type whose constructor parameter or field is typed
+       `IHttpClientFactory`/`HttpClient` is recorded as an `Outbound HttpApi` integration.
+       The *presence* of outbound HTTP capability is authoritative (a real BCL/DI type),
+       but the actual destination host/service normally resolves from configuration/DI at
+       runtime and cannot be determined from static syntax; `LogicalTarget` therefore
+       records the calling type, not the real downstream target. Every hit sets
+       `RequiresReview = true` with this limitation recorded in `BlindSpots`.
+  - **Owning-context linking reuses Phase 5 output, best-effort only (orchestrator Q1).**
+    `AppendIntegrationsAsync` resolves `OwningContextCandidateId` only when the
+    integration's originating artifact already has a `DependencyGraphNode` with a
+    `ContextMembership` from `seed-contexts` on the *same run* — no `SharedInfrastructure`-
+    style fallback tag is applied to unresolved integrations; they are simply left
+    unlinked. This requires artifact IDs to be stable across CLI commands on one run: an
+    early bug had `classify-integrations` unconditionally calling `AppendArtifactAsync`
+    for every file, creating new artifact rows that never matched the artifact IDs
+    `build-graph` had already recorded, so 0 integrations linked despite correct link
+    logic. Fixed by having the CLI look up existing artifacts for the run by
+    `(Path, ContentHash)` and reuse them before appending new ones — any future Discovery
+    CLI command that re-scans files already artifact-tracked by an earlier phase on the
+    same run must do the same lookup-and-reuse, or downstream `ArtifactId` joins will
+    silently fail to match.
+  - **Real PlanBoard pilot run** (`RUN-ED2EB345`, full pipeline: `classify-roles` →
+    `build-graph` (553 nodes / 1,601 edges, unchanged from the Phase 5 baseline) →
+    `seed-contexts` (28 candidate contexts, unchanged) → `classify-integrations` →
+    `export-integrations`) produced **114 integrations**, all citation-backed:
+    - By classification: `RuntimeApplication` 60, `PlatformIdentity` 48, `Observability`
+      5, `Delivery` 1.
+    - By category: `HttpApi` 47, `IdentityOrAuthorization` 43, `Messaging` 7,
+      `ServiceDiscoveryOrPlatformConfig` 10, `Notification` 3,
+      `ScheduledOrBackgroundProcess` 2, `DatabaseOrSharedStore` 2, `FileImportExport` 0
+      (a legitimate absence in this codebase, not a bug).
+    - `RequiresReview = true` on 26 integrations (the three flagged heuristics above; 15
+      of these are the new outbound `HttpClientFactoryOrHttpClientConsumer` hits).
+    - **109 of 114** integrations resolved an `OwningContextCandidateId`; the remaining 5
+      are plausible cross-cutting/platform hits (e.g. some identity/observability code)
+      with no specific owning business context in the Phase 5 seeding — left unlinked
+      rather than force-tagged, per the best-effort-only design decision.
+  - **Correction: test-project files no longer counted as integrations.** An earlier run
+    of this pilot (`RUN-F53828C1`) reported 112 integrations, but
+    `IntegrationClassifier.ClassifyProject` was not excluding test-project paths the way
+    `ArtifactRoleClassifier` already did for role assignments, so test doubles/fixtures
+    referencing production SDK namespaces or controller-shaped test helpers were
+    double-counted as real integrations. Fixed by extracting the existing private
+    test-path check in `ArtifactRoleClassifier` into a public
+    `ArtifactRoleClassifier.IsTestPath(string)` method and having
+    `IntegrationClassifier.ClassifyProject` exclude it too (13 integrations removed,
+    99 remained before the outbound-HttpClient rule below was added on top).
+  - **Neo4j / read-only graph projection remains deferred (§12).** `IntegrationLink`
+    records a neutral `(LinkedRecordKind, LinkedRecordId)` pair (`GraphNode`,
+    `RoleAssignment`, or `ContextCandidate`) so a later graph projection can consume it
+    without requiring any schema change now; this phase does not implement or require
+    Neo4j.

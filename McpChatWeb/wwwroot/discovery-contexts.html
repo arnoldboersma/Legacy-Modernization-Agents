@@ -15,6 +15,16 @@
     button:hover { background: #334155; }
     .card { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
     .card h3 { margin-top: 0; }
+    details.card-item { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 10px 16px; margin-bottom: 8px; }
+    details.card-item > summary { cursor: pointer; list-style: none; }
+    details.card-item > summary::-webkit-details-marker { display: none; }
+    details.card-item > summary::before { content: '▸ '; }
+    details.card-item[open] > summary::before { content: '▾ '; }
+    .card-detail { padding-top: 10px; }
+    .muted { opacity: 0.75; font-size: 13px; }
+    .summary-bar { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; font-size: 13px; }
+    .summary-bar span { background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 4px 10px; }
+    .count { background: #334155; border-radius: 999px; padding: 2px 8px; font-size: 12px; margin-left: 6px; }
     .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; margin-left: 8px; }
     .badge-candidate { background: #475569; }
     .badge-review { background: #b45309; }
@@ -37,7 +47,8 @@
   <h1>🗺️ Discovery Factory — Candidate Contexts</h1>
   <p>
     <a href="index.html">&larr; Back to migration insights</a> ·
-    <a href="discovery-review.html">Review queue</a>
+    <a href="discovery-review.html">Review queue</a> ·
+    <a href="discovery-integrations.html">Integration inventory</a>
   </p>
   <p class="empty">
     Candidate logical contexts / module boundaries (issue #3). Every candidate is evidence-backed
@@ -52,6 +63,7 @@
     <span id="status-msg"></span>
   </div>
 
+  <div id="summary-bar" class="summary-bar"></div>
   <div id="dependencies"></div>
   <div id="contexts"></div>
 

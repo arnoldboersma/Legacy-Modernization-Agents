@@ -32,11 +32,14 @@
     .btn-evidence { background: #b45309; }
     .empty { opacity: 0.7; font-style: italic; }
     .error { color: #f87171; }
+    .summary-bar { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; font-size: 13px; }
+    .summary-bar span { background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 4px 10px; }
+    details.evidence-toggle > summary { cursor: pointer; margin: 6px 0; }
   </style>
 </head>
 <body>
   <h1>🔎 Discovery Factory — Review Queue</h1>
-  <p><a href="index.html">&larr; Back to migration insights</a> · <a href="discovery-contexts.html">Candidate contexts</a></p>
+  <p><a href="index.html">&larr; Back to migration insights</a> · <a href="discovery-contexts.html">Candidate contexts</a> · <a href="discovery-integrations.html">Integration inventory</a></p>
 
   <div class="toolbar">
     <label for="run-select">Run:</label>
@@ -45,6 +48,7 @@
     <span id="status-msg"></span>
   </div>
 
+  <div id="summary-bar" class="summary-bar"></div>
   <div id="queue"></div>
 
   <script src="discovery-review.js"></script>

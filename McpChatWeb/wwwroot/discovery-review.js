@@ -3,6 +3,7 @@
 
 const runSelect = document.getElementById('run-select');
 const queueEl = document.getElementById('queue');
+const summaryBarEl = document.getElementById('summary-bar');
 const statusEl = document.getElementById('status-msg');
 const refreshBtn = document.getElementById('refresh-btn');
 
@@ -45,16 +46,28 @@ async function loadRuns() {
 }
 
 async function loadQueue(runId) {
-  if (!runId) { queueEl.innerHTML = ''; return; }
+  if (!runId) { queueEl.innerHTML = ''; summaryBarEl.innerHTML = ''; return; }
   queueEl.innerHTML = '<p class="empty">Loading review queue…</p>';
   try {
     const res = await fetch(`/api/discovery/runs/${encodeURIComponent(runId)}/queue`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const items = await res.json();
+    renderSummaryBar(items);
     renderQueue(items);
   } catch (err) {
     queueEl.innerHTML = `<p class="error">Failed to load queue: ${err.message}</p>`;
   }
+}
+
+function renderSummaryBar(items) {
+  if (!items.length) { summaryBarEl.innerHTML = ''; return; }
+  const byStatus = new Map();
+  for (const item of items) {
+    const status = item.status || item.Status;
+    byStatus.set(status, (byStatus.get(status) || 0) + 1);
+  }
+  const statusHtml = [...byStatus.entries()].map(([status, count]) => `<span>${escapeHtml(status)}: <strong>${count}</strong></span>`).join('');
+  summaryBarEl.innerHTML = `<span>Total awaiting review: <strong>${items.length}</strong></span>${statusHtml}`;
 }
 
 function renderQueue(items) {
@@ -94,8 +107,10 @@ function renderQueue(items) {
       <div><strong>Statement:</strong> ${escapeHtml(item.statement || item.Statement)}</div>
       <div><strong>Confidence:</strong> ${item.confidence ?? item.Confidence}</div>
       ${llmHtml}
-      <div><strong>Evidence / citations:</strong></div>
-      ${evidenceHtml || '<p class="empty">No evidence attached.</p>'}
+      <details class="evidence-toggle">
+        <summary>Evidence / citations (${(item.evidence || item.Evidence || []).length})</summary>
+        ${evidenceHtml || '<p class="empty">No evidence attached.</p>'}
+      </details>
       <div class="actions">
         <input type="text" placeholder="Rationale (required)" data-role="rationale" />
         <button class="btn-publish" data-action="publish">✅ Publish</button>

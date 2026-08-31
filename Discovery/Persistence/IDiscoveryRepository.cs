@@ -65,4 +65,11 @@ public interface IDiscoveryRepository
 
     Task AppendContextDependencyEdgeAsync(ContextDependencyEdge edge, CancellationToken cancellationToken = default);
     Task<IReadOnlyList<ContextDependencyEdge>> GetContextDependencyEdgesAsync(string runId, CancellationToken cancellationToken = default);
+
+    Task AppendIntegrationAsync(Integration integration, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<Integration>> GetIntegrationsAsync(string runId, CancellationToken cancellationToken = default);
+    Task<Integration?> GetIntegrationAsync(string integrationId, CancellationToken cancellationToken = default);
+
+    Task AppendIntegrationLinkAsync(IntegrationLink link, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<IntegrationLink>> GetIntegrationLinksAsync(string integrationId, CancellationToken cancellationToken = default);
 }

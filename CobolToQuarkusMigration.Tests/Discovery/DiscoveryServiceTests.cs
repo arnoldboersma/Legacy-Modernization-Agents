@@ -365,5 +365,101 @@ public sealed class DiscoveryServiceTests : IDisposable
         candidates.Should().ContainSingle();
         candidates[0].Kind.Should().Be(ContextCandidateKind.SharedInfrastructure);
     }
+
+    [Fact]
+    public async Task AppendIntegrationsAsync_PersistsIntegrationWithEvidenceProvenanceAndBestEffortContextLink()
+    {
+        var run = await _service.StartRunAsync("Subject", "/tmp", "rev1", Array.Empty<string>(), Array.Empty<string>(), "Static source only");
+        var artifact = await _service.AppendArtifactAsync(run.RunId, "Forecast/ForecastService.cs", "CSharp", "h1");
+
+        var nodeCandidates = new List<(CobolToQuarkusMigration.Discovery.Graph.GraphNodeCandidate, string?)>
+        {
+            (new CobolToQuarkusMigration.Discovery.Graph.GraphNodeCandidate(
+                GraphNodeKind.Type, "App.Forecast.ForecastService", "ForecastService", artifact.Path,
+                new[] { new CobolToQuarkusMigration.Discovery.Graph.GraphEvidenceCitation("TypeDeclaration", "Forecast/ForecastService.cs:L1", "Type 'ForecastService' declared.") }),
+             artifact.ArtifactId),
+        };
+        await _service.AppendDependencyGraphAsync(run.RunId, nodeCandidates, Array.Empty<CobolToQuarkusMigration.Discovery.Graph.GraphEdgeCandidate>(), producerVersion: "test-graph-builder-v1");
+        var contexts = await _service.SeedContextCandidatesAsync(run.RunId, producerVersion: "test-context-seeder-v1");
+        contexts.Should().ContainSingle();
+
+        var candidate = new CobolToQuarkusMigration.Discovery.Integrations.IntegrationCandidate(
+            IntegrationCategory.DatabaseOrSharedStore,
+            IntegrationClassification.RuntimeApplication,
+            IntegrationDirection.Outbound,
+            TriggerOrCaller: "ForecastService",
+            ProtocolOrMechanism: "EF Core / SQL Server",
+            LogicalTarget: "ForecastService",
+            ConfigurationKeySemantics: null,
+            RedactedContractShape: null,
+            AuthenticationSemantics: null,
+            ReliabilityBehavior: null,
+            Confidence: 0.9,
+            ClassificationRule: "EfDbContextBaseType",
+            BlindSpots: Array.Empty<string>(),
+            RequiresReview: false,
+            ArtifactPath: artifact.Path,
+            Citations: new[] { new CobolToQuarkusMigration.Discovery.Integrations.IntegrationEvidenceCitation("EfDbContextBaseType", "Forecast/ForecastService.cs:L1", "Type 'ForecastService' derives from a DbContext base type.") });
+
+        var integrations = await _service.AppendIntegrationsAsync(
+            run.RunId,
+            new[] { (candidate, (string?)artifact.ArtifactId) },
+            producerVersion: "test-integration-classifier-v1");
+
+        integrations.Should().ContainSingle();
+        var integration = integrations[0];
+        integration.Category.Should().Be(IntegrationCategory.DatabaseOrSharedStore);
+        integration.Classification.Should().Be(IntegrationClassification.RuntimeApplication);
+        integration.EvidenceIds.Should().NotBeEmpty();
+        integration.ProvenanceId.Should().NotBeNullOrWhiteSpace();
+        // Best-effort owning-context resolution: the artifact is already graphed and belongs to
+        // the seeded "Forecast" context, so it should resolve without any fallback tagging.
+        integration.OwningContextCandidateId.Should().Be(contexts[0].ContextCandidateId);
+
+        var persisted = await _service.GetIntegrationsAsync(run.RunId);
+        persisted.Should().ContainSingle();
+
+        var links = await _service.GetIntegrationLinksAsync(integration.IntegrationId);
+        links.Should().ContainSingle(l => l.LinkedRecordKind == IntegrationLinkedRecordKind.ContextCandidate && l.LinkedRecordId == contexts[0].ContextCandidateId);
+    }
+
+    [Fact]
+    public async Task AppendIntegrationsAsync_LeavesUnresolvableIntegrationUnlinked_NoFallbackTagging()
+    {
+        var run = await _service.StartRunAsync("Subject", "/tmp", "rev1", Array.Empty<string>(), Array.Empty<string>(), "Static source only");
+        var artifact = await _service.AppendArtifactAsync(run.RunId, "Worker/ReminderWorker.cs", "CSharp", "h1");
+
+        var candidate = new CobolToQuarkusMigration.Discovery.Integrations.IntegrationCandidate(
+            IntegrationCategory.ScheduledOrBackgroundProcess,
+            IntegrationClassification.RuntimeApplication,
+            IntegrationDirection.Outbound,
+            TriggerOrCaller: "Host scheduler / hosted service lifecycle",
+            ProtocolOrMechanism: "BackgroundService / IHostedService",
+            LogicalTarget: "ReminderWorker",
+            ConfigurationKeySemantics: null,
+            RedactedContractShape: null,
+            AuthenticationSemantics: null,
+            ReliabilityBehavior: null,
+            Confidence: 0.6,
+            ClassificationRule: "BackgroundServiceBaseTypeWithPathBasedDeliverySplit",
+            BlindSpots: new[] { "Path-based heuristic; not authoritative." },
+            RequiresReview: true,
+            ArtifactPath: artifact.Path,
+            Citations: new[] { new CobolToQuarkusMigration.Discovery.Integrations.IntegrationEvidenceCitation("BackgroundServiceBaseType", "Worker/ReminderWorker.cs:L1", "Type 'ReminderWorker' derives from BackgroundService.") });
+
+        // No graph/context seeding performed for this artifact, so no owning context can resolve.
+        var integrations = await _service.AppendIntegrationsAsync(
+            run.RunId,
+            new[] { (candidate, (string?)artifact.ArtifactId) },
+            producerVersion: "test-integration-classifier-v1");
+
+        integrations.Should().ContainSingle();
+        integrations[0].OwningContextCandidateId.Should().BeNull();
+        integrations[0].RequiresReview.Should().BeTrue();
+        integrations[0].BlindSpots.Should().NotBeEmpty();
+
+        var links = await _service.GetIntegrationLinksAsync(integrations[0].IntegrationId);
+        links.Should().BeEmpty("unresolved integrations are left unlinked, with no fallback tagging");
+    }
 }
 
