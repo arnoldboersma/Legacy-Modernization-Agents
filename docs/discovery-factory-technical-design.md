@@ -1,4 +1,4 @@
-**Last updated**: 2026-08-30
+**Last updated**: 2026-09-06
 
 # Discovery Factory technical design
 
@@ -629,5 +629,64 @@ not change the deferred decisions in §12.
   non-business role, sets `RequiresReview = true` and receives reduced confidence — the
   classifier never collapses conflicting evidence into a single guessed role (issue #8
   scope item 3).
+- **Phase 5 (issue #3) reuses `ReviewStatus` rather than introducing a dedicated context
+  lifecycle enum.** Candidate contexts are governed `ContextCandidate` records whose
+  `Status` is the existing finding `ReviewStatus` enum: `Candidate` (Plausible, confidence
+  ≥ 0.55) or `NeedsEvidence` (Unconfirmed, confidence < 0.55). `Published`/`Rejected` are
+  reachable only through the same human-review path used for findings (§5.4); nothing in
+  `ContextSeeder`/`DiscoveryService.SeedContextCandidatesAsync` can move a candidate past
+  `Candidate`, matching the constraint that LLM/heuristic output may explain and
+  prioritize but never establish or publish a context claim.
+- **Dependency graph is syntax-tree-only, like Phase 4's role classifier.**
+  `Discovery/Graph/DependencyGraphBuilder.cs` builds project-level nodes/edges from
+  `.csproj` `ProjectReference` elements and type-level nodes/edges (`ContainsType`,
+  `References`, `Injects`, `MapsToEntity`, `ExposesRoute`) by parsing each `.cs` file with
+  Roslyn `CSharpSyntaxTree` — no `CSharpCompilation`/`SemanticModel` is built. `References`
+  edges are therefore a same-name identifier-reference proxy (as in the Phase 4 `Shared`
+  fan-in heuristic), not resolved symbol binding; two distinct types sharing a name in
+  different namespaces could be conflated. This is an accepted limitation for this phase;
+  full semantic analysis remains deferred per §12.
+- **Context seeding never equates a project or controller with a context.**
+  `Discovery/Graph/ContextSeeder.cs` clusters `Type` graph nodes by a namespace-segment
+  heuristic (`ClusterKey`) that skips a fixed list of technical segment names (Controllers,
+  Services, Models, Repositories, etc.) and clusters on the first remaining, more
+  domain-specific segment — so a controller, its DTOs, and its repository in different
+  projects can land in the same candidate context, and a single project spanning multiple
+  domains yields multiple candidates. Each candidate's `EvidenceIds` (persisted by
+  `DiscoveryService.SeedContextCandidatesAsync`) include both the cross-cluster graph-edge
+  evidence and each member node's own declaration evidence, so even an edge-free singleton
+  cluster carries at least one citation — satisfying "every context claim has stable
+  finding links and citations" even in the sparsest case.
+- **Shared/infrastructure nodes are excluded from business-context clustering by
+  construction.** `ContextSeeder` reuses the Phase 4 `RoleAssignment`s (passed in as an
+  input signal, not re-derived) to classify each candidate cluster as `BusinessContext` or
+  `SharedInfrastructure`: a cluster is `SharedInfrastructure` only if none of its member
+  types carry a `Business`/`Unknown`-leaning role and at least one carries a recognized
+  infrastructure tag (CompositionDI, Middleware, FrameworkAdapter, Persistence/EF,
+  IntegrationAdapter, Shared, Generated, Test, BuildTooling); mixed clusters remain
+  `BusinessContext` so the mixed boundary stays visible rather than silently discarded.
+- **Live PlanBoard run validates the whole-solution + Forecast Management acceptance
+  criteria.** `discovery build-graph --source-dir <PlanBoard path>` was run against the
+  real, local PlanBoard checkout (14 projects, 354 `.cs` files), producing 553 graph nodes
+  (14 Project, 65 Namespace, 298 Type, 163 Route, 13 DbEntity) and 1,601 graph edges across
+  `DependsOnProject`, `ContainsType`, `References`, `MapsToEntity`, and `ExposesRoute`.
+  `discovery seed-contexts` then produced 22 candidate contexts spanning the whole
+  solution — including a `ForecastApprovals` candidate (confidence 0.70, rule
+  `NamespaceCoLocation;NamingConvention;CouplingDensity`) whose membership and evidence
+  cite real PlanBoard source such as
+  `Planbordv2.WebApp/Controllers/ForecastApprovalController.cs` and
+  `Planbordv2.Models/ViewModels/ForecastApprovals/ForecastApproveData.cs` — plus 50
+  cross-context dependency edges (e.g. `ForecastApprovals -> Planbordv2`) that keep
+  cross-cutting/platform coupling visible rather than merged into a context. All
+  candidates remained `Candidate`/`NeedsEvidence` (never `Published`); no PlanBoard source
+  was copied into this repository, only governed records citing it.
+- **Minimal portal UI addition for context review.** `McpChatWeb/wwwroot/
+  discovery-contexts.html`/`.js` is a new, additive page (same style as the existing
+  `discovery-review.html` review queue) that lists candidate contexts with confidence,
+  kind (Business/Shared), Plausible/Unconfirmed status, membership, and evidence, plus the
+  cross-context dependency table, backed by a new
+  `GET /api/discovery/runs/{runId}/contexts` endpoint. The existing review-queue page is
+  unchanged except for one added navigation link; it is not otherwise modified or
+  regressed.
 
 

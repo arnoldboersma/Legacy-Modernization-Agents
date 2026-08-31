@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Discovery Factory — Review Queue</title>
+  <title>Discovery Factory — Candidate Contexts</title>
   <link rel="stylesheet" href="styles.css">
   <style>
     body { background: #0f172a; color: #e2e8f0; font-family: system-ui, sans-serif; margin: 0; padding: 24px; }
@@ -23,20 +23,27 @@
     .badge-needs-evidence { background: #b45309; }
     .badge-redacted { background: #7c3aed; }
     .badge-clean { background: #334155; }
+    .badge-shared { background: #1d4ed8; }
+    .badge-business { background: #0891b2; }
     .evidence { background: #0b1220; border: 1px solid #334155; border-radius: 6px; padding: 8px; margin: 6px 0; font-family: monospace; font-size: 13px; white-space: pre-wrap; }
-    .why { background: #0b1220; border-left: 3px solid #f59e0b; padding: 8px 12px; margin: 8px 0; }
-    .actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
-    .actions input[type="text"] { flex: 1; min-width: 240px; background: #0b1220; border: 1px solid #334155; color: #e2e8f0; border-radius: 6px; padding: 6px 10px; }
-    .btn-publish { background: #15803d; }
-    .btn-reject { background: #b91c1c; }
-    .btn-evidence { background: #b45309; }
+    .members { background: #0b1220; border: 1px solid #334155; border-radius: 6px; padding: 8px; margin: 6px 0; font-family: monospace; font-size: 12px; max-height: 220px; overflow-y: auto; }
     .empty { opacity: 0.7; font-style: italic; }
     .error { color: #f87171; }
+    .deps table { border-collapse: collapse; width: 100%; }
+    .deps td, .deps th { border-bottom: 1px solid #334155; padding: 4px 8px; text-align: left; font-size: 13px; }
   </style>
 </head>
 <body>
-  <h1>🔎 Discovery Factory — Review Queue</h1>
-  <p><a href="index.html">&larr; Back to migration insights</a> · <a href="discovery-contexts.html">Candidate contexts</a></p>
+  <h1>🗺️ Discovery Factory — Candidate Contexts</h1>
+  <p>
+    <a href="index.html">&larr; Back to migration insights</a> ·
+    <a href="discovery-review.html">Review queue</a>
+  </p>
+  <p class="empty">
+    Candidate logical contexts / module boundaries (issue #3). Every candidate is evidence-backed
+    and remains Plausible (Candidate/HumanReview) or Unconfirmed (NeedsEvidence) until a human
+    reviewer confirms it out-of-band — this page never publishes a context claim.
+  </p>
 
   <div class="toolbar">
     <label for="run-select">Run:</label>
@@ -45,8 +52,9 @@
     <span id="status-msg"></span>
   </div>
 
-  <div id="queue"></div>
+  <div id="dependencies"></div>
+  <div id="contexts"></div>
 
-  <script src="discovery-review.js"></script>
+  <script src="discovery-contexts.js"></script>
 </body>
 </html>

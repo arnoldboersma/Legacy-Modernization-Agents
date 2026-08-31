@@ -436,6 +436,250 @@ public sealed class DiscoveryService
     public Task<IReadOnlyList<RoleAssignment>> GetRoleAssignmentsAsync(string runId, CancellationToken cancellationToken = default)
         => _repository.GetRoleAssignmentsAsync(runId, cancellationToken);
 
+    // ---------------------------------------------------------------------------------------
+    // Discovery Factory phase 5 (issue #3): dependency graph construction and candidate context
+    // seeding. Never invents a fact: every node/edge/candidate below is produced by a
+    // deterministic extractor (Discovery/Graph) and cites its own evidence.
+    // ---------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Persists a set of already-extracted graph node/edge candidates (produced by the caller,
+    /// typically via <see cref="Graph.DependencyGraphBuilder"/>, from artifact source text) with
+    /// cited evidence and provenance. Node de-duplication is by symbol locator within the run: a
+    /// symbol already appended as a node in this run is not re-appended.
+    /// </summary>
+    public async Task<(IReadOnlyList<DependencyGraphNode> Nodes, IReadOnlyList<DependencyGraphEdge> Edges)> AppendDependencyGraphAsync(
+        string runId,
+        IReadOnlyList<(Graph.GraphNodeCandidate Candidate, string? ArtifactId)> nodeCandidates,
+        IReadOnlyList<Graph.GraphEdgeCandidate> edgeCandidates,
+        string producerVersion,
+        CancellationToken cancellationToken = default)
+    {
+        var existingNodes = await _repository.GetGraphNodesAsync(runId, cancellationToken);
+        var nodesBySymbol = existingNodes.ToDictionary(n => n.SymbolLocator, StringComparer.Ordinal);
+        var appendedNodes = new List<DependencyGraphNode>();
+
+        foreach (var (candidate, artifactId) in nodeCandidates)
+        {
+            if (nodesBySymbol.ContainsKey(candidate.SymbolLocator))
+            {
+                continue;
+            }
+
+            var evidenceIds = new List<string>();
+            foreach (var citation in candidate.Citations)
+            {
+                var evidence = await AppendEvidenceAsync(runId, EvidenceType.SourceCode, citation.Locator, artifactId,
+                    rawExcerpt: $"[{citation.RuleName}] {citation.Excerpt}", cancellationToken);
+                evidenceIds.Add(evidence.EvidenceId);
+            }
+
+            var node = new DependencyGraphNode
+            {
+                NodeId = NewId("GNODE"),
+                RunId = runId,
+                Kind = candidate.Kind,
+                SymbolLocator = candidate.SymbolLocator,
+                DisplayName = candidate.DisplayName,
+                ArtifactId = artifactId,
+                EvidenceIds = evidenceIds,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+            };
+            await _repository.AppendGraphNodeAsync(node, cancellationToken);
+            nodesBySymbol[node.SymbolLocator] = node;
+            appendedNodes.Add(node);
+        }
+
+        var appendedEdges = new List<DependencyGraphEdge>();
+        foreach (var candidate in edgeCandidates)
+        {
+            if (!nodesBySymbol.TryGetValue(candidate.FromSymbolLocator, out var fromNode) ||
+                !nodesBySymbol.TryGetValue(candidate.ToSymbolLocator, out var toNode))
+            {
+                // Edge references a symbol with no corresponding node in this run (e.g. an
+                // external/unresolved type): skip rather than fabricate a placeholder node.
+                continue;
+            }
+
+            var evidenceIds = new List<string>();
+            foreach (var citation in candidate.Citations)
+            {
+                var evidence = await AppendEvidenceAsync(runId, EvidenceType.SourceCode, citation.Locator, fromNode.ArtifactId,
+                    rawExcerpt: $"[{citation.RuleName}] {citation.Excerpt}", cancellationToken);
+                evidenceIds.Add(evidence.EvidenceId);
+            }
+
+            var edge = new DependencyGraphEdge
+            {
+                EdgeId = NewId("GEDGE"),
+                RunId = runId,
+                FromNodeId = fromNode.NodeId,
+                ToNodeId = toNode.NodeId,
+                Kind = candidate.Kind,
+                EvidenceIds = evidenceIds,
+                Confidence = candidate.Confidence,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+            };
+            await _repository.AppendGraphEdgeAsync(edge, cancellationToken);
+            appendedEdges.Add(edge);
+        }
+
+        var provenance = new Provenance
+        {
+            ProvenanceId = NewId("PROV"),
+            RunId = runId,
+            ProducerKind = "DeterministicExtractor",
+            ProducerVersion = producerVersion,
+            InputRecordIds = appendedNodes.Select(n => n.NodeId).Concat(appendedEdges.Select(e => e.EdgeId)).ToList(),
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+        };
+        await _repository.AppendProvenanceAsync(provenance, cancellationToken);
+
+        return (appendedNodes, appendedEdges);
+    }
+
+    public Task<IReadOnlyList<DependencyGraphNode>> GetGraphNodesAsync(string runId, CancellationToken cancellationToken = default)
+        => _repository.GetGraphNodesAsync(runId, cancellationToken);
+
+    public Task<IReadOnlyList<DependencyGraphEdge>> GetGraphEdgesAsync(string runId, CancellationToken cancellationToken = default)
+        => _repository.GetGraphEdgesAsync(runId, cancellationToken);
+
+    /// <summary>
+    /// Runs <see cref="Graph.ContextSeeder"/> over the run's persisted graph and Phase 4 role
+    /// assignments, appending candidate contexts, memberships, and cross-context dependency
+    /// edges. Every candidate starts life as <see cref="ReviewStatus.Candidate"/> (Plausible) or
+    /// <see cref="ReviewStatus.NeedsEvidence"/> (Unconfirmed); this method never assigns
+    /// <see cref="ReviewStatus.Published"/> — only a human reviewer decision (design doc §5.4)
+    /// can confirm a candidate, mirroring the finding-review lifecycle.
+    /// </summary>
+    public async Task<IReadOnlyList<ContextCandidate>> SeedContextCandidatesAsync(
+        string runId,
+        string producerVersion,
+        CancellationToken cancellationToken = default)
+    {
+        var nodes = await _repository.GetGraphNodesAsync(runId, cancellationToken);
+        var edges = await _repository.GetGraphEdgesAsync(runId, cancellationToken);
+        var roleAssignments = await _repository.GetRoleAssignmentsAsync(runId, cancellationToken);
+
+        var seedResult = Graph.ContextSeeder.SeedCandidates(nodes, edges, roleAssignments);
+
+        var nodesById = nodes.ToDictionary(n => n.NodeId, StringComparer.Ordinal);
+        var edgesById = edges.ToDictionary(e => e.EdgeId, StringComparer.Ordinal);
+        var candidatesByName = new Dictionary<string, ContextCandidate>(StringComparer.Ordinal);
+        var results = new List<ContextCandidate>();
+
+        foreach (var seed in seedResult.Candidates)
+        {
+            var evidenceIds = new List<string>();
+            foreach (var edgeId in seed.EvidenceGraphEdgeIds)
+            {
+                if (edgesById.TryGetValue(edgeId, out var edge))
+                {
+                    evidenceIds.AddRange(edge.EvidenceIds);
+                }
+            }
+
+            // Every candidate must carry stable citations even when its member nodes have no
+            // touching edges (e.g. a singleton, edge-free cluster): fall back to the member
+            // nodes' own evidence (their originating TypeDeclaration/etc. citations).
+            foreach (var nodeId in seed.MemberNodeIds)
+            {
+                if (nodesById.TryGetValue(nodeId, out var node))
+                {
+                    evidenceIds.AddRange(node.EvidenceIds);
+                }
+            }
+
+            evidenceIds = evidenceIds.Distinct().ToList();
+
+            var provenance = new Provenance
+            {
+                ProvenanceId = NewId("PROV"),
+                RunId = runId,
+                ProducerKind = "DeterministicExtractor",
+                ProducerVersion = producerVersion,
+                InputRecordIds = seed.EvidenceGraphEdgeIds,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+            };
+            await _repository.AppendProvenanceAsync(provenance, cancellationToken);
+
+            // Low-confidence, low-signal candidates are recorded as NeedsEvidence (Unconfirmed)
+            // rather than Candidate (Plausible) — mixed/ambiguous boundaries stay visibly
+            // uncertain instead of being forced into a confident-looking grouping.
+            var status = seed.Confidence >= 0.55 ? ReviewStatus.Candidate : ReviewStatus.NeedsEvidence;
+
+            var candidate = new ContextCandidate
+            {
+                ContextCandidateId = NewId("CTX"),
+                RunId = runId,
+                Name = seed.Name,
+                Kind = seed.Kind,
+                Status = status,
+                Confidence = seed.Confidence,
+                EvidenceIds = evidenceIds,
+                SeedingRule = seed.SeedingRule,
+                ProvenanceId = provenance.ProvenanceId,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+            };
+            await _repository.AppendContextCandidateAsync(candidate, cancellationToken);
+            candidatesByName[seed.Name] = candidate;
+            results.Add(candidate);
+
+            var ownerSet = seed.OwnerNodeIds.ToHashSet(StringComparer.Ordinal);
+            foreach (var nodeId in seed.MemberNodeIds)
+            {
+                var membership = new ContextMembership
+                {
+                    ContextMembershipId = NewId("CMEM"),
+                    RunId = runId,
+                    ContextCandidateId = candidate.ContextCandidateId,
+                    NodeId = nodeId,
+                    Role = ownerSet.Contains(nodeId) ? ContextMembershipRole.Owner : ContextMembershipRole.Member,
+                    EvidenceIds = evidenceIds,
+                    CreatedAtUtc = DateTimeOffset.UtcNow,
+                };
+                await _repository.AppendContextMembershipAsync(membership, cancellationToken);
+            }
+        }
+
+        foreach (var dependency in seedResult.Dependencies)
+        {
+            if (!candidatesByName.TryGetValue(dependency.FromCandidateName, out var fromCandidate) ||
+                !candidatesByName.TryGetValue(dependency.ToCandidateName, out var toCandidate))
+            {
+                continue;
+            }
+
+            var dependencyEvidenceIds = dependency.EvidenceGraphEdgeIds
+                .SelectMany(id => edgesById.TryGetValue(id, out var e) ? e.EvidenceIds : Array.Empty<string>())
+                .Distinct()
+                .ToList();
+
+            var edge = new ContextDependencyEdge
+            {
+                ContextDependencyEdgeId = NewId("CDEP"),
+                RunId = runId,
+                FromContextCandidateId = fromCandidate.ContextCandidateId,
+                ToContextCandidateId = toCandidate.ContextCandidateId,
+                EvidenceIds = dependencyEvidenceIds,
+                Confidence = dependency.Confidence,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+            };
+            await _repository.AppendContextDependencyEdgeAsync(edge, cancellationToken);
+        }
+
+        return results;
+    }
+
+    public Task<IReadOnlyList<ContextCandidate>> GetContextCandidatesAsync(string runId, CancellationToken cancellationToken = default)
+        => _repository.GetContextCandidatesAsync(runId, cancellationToken);
+
+    public Task<IReadOnlyList<ContextMembership>> GetContextMembershipsForContextAsync(string contextCandidateId, CancellationToken cancellationToken = default)
+        => _repository.GetContextMembershipsForContextAsync(contextCandidateId, cancellationToken);
+
+    public Task<IReadOnlyList<ContextDependencyEdge>> GetContextDependencyEdgesAsync(string runId, CancellationToken cancellationToken = default)
+        => _repository.GetContextDependencyEdgesAsync(runId, cancellationToken);
+
     /// <summary>
     /// Returns only the role assignments eligible to seed LLM business-use-case prompts by
     /// default (design doc §5.4): assignments whose roles are exclusively <see cref="ArtifactRoleTag.Business"/>
