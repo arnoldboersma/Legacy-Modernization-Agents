@@ -742,5 +742,21 @@ not change the deferred decisions in §12.
     framework-namespace-dominant exclusion with no role data, the PlanBoard-code-in-
     framework-namespace edge case, a mixed-namespace cluster, and the
     `TechnicalCatchAll` root-fallback split.
+  - **Known limitation (not fixed in this pass):** generic/cross-cutting namespace
+    segments — e.g. `Shared`, `Common`, `Core`, `Utilities`, `Infrastructure` — can still
+    seed as a confident `BusinessContext` candidate. Manual review of the PlanBoard run
+    found a `Shared` cluster (confidence 0.86, 6 members including
+    `NotificationOutboxRepository` and a shared view model) scored purely on
+    `NamespaceCoLocation`/`CouplingDensity` signals, the same way any other repeated
+    namespace segment (e.g. `Employees`) would be scored. Unlike the `Hosting` case, this
+    is not a framework-namespace problem — `Shared` is PlanBoard's own namespace — so the
+    framework-namespace hard filter correctly does not (and should not) touch it. The
+    seeder currently has no signal for "this segment name is a generic/cross-cutting
+    bucket, not a specific business capability," regardless of how strong its coupling or
+    co-location signal is. Deferred rather than fixed now to avoid inventing another ad
+    hoc heuristic; a good candidate for a future LLM-assisted triage pass that
+    *prioritizes/explains* review attention on such ambiguous clusters — consistent with
+    the existing non-authoritative-LLM constraint (LLM may explain and prioritize, never
+    reclassify or publish a context claim on its own).
 
 
