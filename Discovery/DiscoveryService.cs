@@ -1,6 +1,7 @@
 using CobolToQuarkusMigration.Discovery.Models;
 using CobolToQuarkusMigration.Discovery.Persistence;
 using CobolToQuarkusMigration.Discovery.Redaction;
+using CobolToQuarkusMigration.Discovery.Roles;
 using Microsoft.Extensions.Logging;
 
 namespace CobolToQuarkusMigration.Discovery;
@@ -354,6 +355,102 @@ public sealed class DiscoveryService
 
     public Task<IReadOnlyList<ReviewDecision>> GetReviewDecisionsAsync(string findingRevisionId, CancellationToken cancellationToken = default)
         => _repository.GetReviewDecisionsAsync(findingRevisionId, cancellationToken);
+
+    /// <summary>
+    /// Runs the deterministic <see cref="ArtifactRoleClassifier"/> over one project's source
+    /// files, appending an evidence-backed <see cref="RoleAssignment"/> (and its citing evidence
+    /// records) per classified symbol. Design doc §5, §5.1, issue #8: multiple role tags may
+    /// co-occur, and mixed/unknown results are marked <see cref="RoleAssignment.RequiresReview"/>
+    /// rather than collapsed to a single guessed role.
+    /// </summary>
+    public async Task<IReadOnlyList<RoleAssignment>> ClassifyArtifactRolesAsync(
+        string runId,
+        IReadOnlyList<(SourceArtifact Artifact, string SourceText)> artifacts,
+        string producerVersion,
+        CancellationToken cancellationToken = default)
+    {
+        var files = artifacts.Select(a => new ClassifierSourceFile(a.Artifact.Path, a.SourceText)).ToList();
+        var classifications = ArtifactRoleClassifier.ClassifyProject(files);
+
+        var artifactsByPath = artifacts.ToDictionary(a => a.Artifact.Path.Replace('\\', '/'), a => a.Artifact);
+        var results = new List<RoleAssignment>();
+
+        foreach (var classification in classifications)
+        {
+            // The classifier's symbol locator is namespace-qualified for types, or the raw path
+            // for whole-file classifications (top-level statements, build-tooling files); resolve
+            // back to the originating artifact by matching path prefix.
+            var artifact = artifactsByPath.Values.FirstOrDefault(a =>
+                classification.SymbolLocator.Equals(a.Path.Replace('\\', '/'), StringComparison.Ordinal) ||
+                classification.Citations.Any(c => c.Locator.StartsWith(a.Path.Replace('\\', '/') + ":", StringComparison.Ordinal)));
+            if (artifact is null)
+            {
+                continue;
+            }
+
+            var evidenceIds = new List<string>();
+            foreach (var citation in classification.Citations)
+            {
+                var evidence = await AppendEvidenceAsync(
+                    runId,
+                    EvidenceType.SourceCode,
+                    citation.Locator,
+                    artifact.ArtifactId,
+                    rawExcerpt: $"[{citation.RuleName}] {citation.Excerpt}",
+                    cancellationToken);
+                evidenceIds.Add(evidence.EvidenceId);
+            }
+
+            var provenance = new Provenance
+            {
+                ProvenanceId = NewId("PROV"),
+                RunId = runId,
+                ProducerKind = "DeterministicExtractor",
+                ProducerVersion = producerVersion,
+                InputRecordIds = evidenceIds,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+            };
+            await _repository.AppendProvenanceAsync(provenance, cancellationToken);
+
+            var assignment = new RoleAssignment
+            {
+                RoleAssignmentId = NewId("ROLE"),
+                RunId = runId,
+                ArtifactId = artifact.ArtifactId,
+                SymbolLocator = classification.SymbolLocator,
+                Roles = classification.Roles,
+                Confidence = classification.Confidence,
+                EvidenceIds = evidenceIds,
+                ClassificationRule = classification.ClassificationRule,
+                RequiresReview = classification.RequiresReview,
+                ProvenanceId = provenance.ProvenanceId,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+            };
+            await _repository.AppendRoleAssignmentAsync(assignment, cancellationToken);
+            results.Add(assignment);
+        }
+
+        return results;
+    }
+
+    public Task<IReadOnlyList<RoleAssignment>> GetRoleAssignmentsAsync(string runId, CancellationToken cancellationToken = default)
+        => _repository.GetRoleAssignmentsAsync(runId, cancellationToken);
+
+    /// <summary>
+    /// Returns only the role assignments eligible to seed LLM business-use-case prompts by
+    /// default (design doc §5.4): assignments whose roles are exclusively <see cref="ArtifactRoleTag.Business"/>
+    /// and/or <see cref="ArtifactRoleTag.Shared"/>, with <see cref="RoleAssignment.RequiresReview"/>
+    /// false. Mixed, unknown, and purely-technical (DI/middleware/persistence/etc.) assignments
+    /// are excluded here but remain fully visible via <see cref="GetRoleAssignmentsAsync"/> for
+    /// reviewer inspection — they are never silently dropped from the governed record set.
+    /// </summary>
+    public async Task<IReadOnlyList<RoleAssignment>> GetBusinessEligibleArtifactsAsync(string runId, CancellationToken cancellationToken = default)
+    {
+        var assignments = await _repository.GetRoleAssignmentsAsync(runId, cancellationToken);
+        return assignments
+            .Where(a => !a.RequiresReview && a.Roles.All(r => r is ArtifactRoleTag.Business or ArtifactRoleTag.Shared))
+            .ToList();
+    }
 
     /// <summary>
     /// Appends a same-content revision row that only changes status, so status transitions are
