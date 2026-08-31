@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Discovery Factory — Specification Factory Handoff</title>
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    body { background: #0f172a; color: #e2e8f0; font-family: system-ui, sans-serif; margin: 0; padding: 24px; }
+    a { color: #60a5fa; }
+    h1 { margin-top: 0; }
+    details.group { margin-top: 20px; }
+    details.group > summary.group-heading { cursor: pointer; list-style: none; font-size: 20px; font-weight: 600; padding: 10px 0; border-bottom: 1px solid #334155; }
+    details.group > summary.group-heading::-webkit-details-marker { display: none; }
+    details.group > summary.group-heading::before { content: '▶ '; font-size: 14px; }
+    details.group[open] > summary.group-heading::before { content: '▼ '; }
+    details.group .group-body { padding-top: 8px; }
+    .count { background: #334155; border-radius: 999px; padding: 2px 8px; font-size: 12px; margin-left: 6px; }
+    .toolbar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
+    select, button { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; }
+    button { cursor: pointer; }
+    button:hover { background: #334155; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    .card h3 { margin-top: 0; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; margin-left: 8px; }
+    .badge-high { background: #b91c1c; }
+    .badge-medium { background: #b45309; }
+    .badge-low { background: #334155; }
+    .badge-gap { background: #7c3aed; }
+    .empty { opacity: 0.7; font-style: italic; }
+    .error { color: #f87171; }
+    .muted { opacity: 0.75; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>📦 Discovery Factory — Specification Factory Handoff</h1>
+  <p>
+    <a href="index.html">&larr; Back to migration insights</a> ·
+    <a href="discovery-review.html">Review queue</a> ·
+    <a href="discovery-contexts.html">Candidate contexts</a> ·
+    <a href="discovery-integrations.html">Integration inventory</a>
+  </p>
+  <p class="empty">
+    Read-only, ten-section handoff assembled from the governed semantic model (design doc §6,
+    issue #5). Neither this page nor the Markdown/JSON export it mirrors is the source of truth —
+    the underlying governed records are. Run <code>discovery build-risk-register</code> then
+    <code>discovery export-handoff</code> to regenerate.
+  </p>
+
+  <div class="toolbar">
+    <label for="run-select">Run:</label>
+    <select id="run-select"></select>
+    <button id="refresh-btn">⟳ Refresh</button>
+    <span id="status-msg"></span>
+  </div>
+
+  <div id="handoff"></div>
+
+  <script src="discovery-handoff.js"></script>
+</body>
+</html>
