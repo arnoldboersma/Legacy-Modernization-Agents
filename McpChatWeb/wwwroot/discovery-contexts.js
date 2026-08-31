@@ -6,6 +6,7 @@
 const runSelect = document.getElementById('run-select');
 const contextsEl = document.getElementById('contexts');
 const dependenciesEl = document.getElementById('dependencies');
+const summaryBarEl = document.getElementById('summary-bar');
 const statusEl = document.getElementById('status-msg');
 const refreshBtn = document.getElementById('refresh-btn');
 
@@ -53,18 +54,41 @@ async function loadRuns() {
 }
 
 async function loadContexts(runId) {
-  if (!runId) { contextsEl.innerHTML = ''; dependenciesEl.innerHTML = ''; return; }
+  if (!runId) { contextsEl.innerHTML = ''; dependenciesEl.innerHTML = ''; summaryBarEl.innerHTML = ''; return; }
   contextsEl.innerHTML = '<p class="empty">Loading candidate contexts…</p>';
   dependenciesEl.innerHTML = '';
   try {
     const res = await fetch(`/api/discovery/runs/${encodeURIComponent(runId)}/contexts`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const body = await res.json();
-    renderContexts(body.contexts || body.Contexts || []);
-    renderDependencies(body.dependencies || body.Dependencies || []);
+    const contexts = body.contexts || body.Contexts || [];
+    const deps = body.dependencies || body.Dependencies || [];
+    renderSummaryBar(contexts, deps);
+    renderContexts(contexts);
+    renderDependencies(deps);
   } catch (err) {
     contextsEl.innerHTML = `<p class="error">Failed to load contexts: ${err.message}</p>`;
   }
+}
+
+function renderSummaryBar(contexts, deps) {
+  if (!contexts.length) { summaryBarEl.innerHTML = ''; return; }
+  const byKind = new Map();
+  for (const c of contexts) {
+    const kind = c.kind || c.Kind;
+    byKind.set(kind, (byKind.get(kind) || 0) + 1);
+  }
+  const needsReview = contexts.filter(c => {
+    const status = c.status || c.Status;
+    return status === 'HumanReview' || status === 'NeedsEvidence';
+  }).length;
+  const kindHtml = [...byKind.entries()].map(([kind, count]) => `<span>${escapeHtml(kind)}: <strong>${count}</strong></span>`).join('');
+  summaryBarEl.innerHTML = `
+    <span>Total contexts: <strong>${contexts.length}</strong></span>
+    ${kindHtml}
+    <span>Needs review: <strong>${needsReview}</strong></span>
+    <span>Cross-context dependencies: <strong>${deps.length}</strong></span>
+  `;
 }
 
 function renderDependencies(deps) {
@@ -77,13 +101,13 @@ function renderDependencies(deps) {
       <td>${(d.confidence ?? d.Confidence).toFixed(2)}</td>
     </tr>`).join('');
   dependenciesEl.innerHTML = `
-    <div class="card deps">
-      <h3>Cross-context dependencies</h3>
+    <details class="card deps">
+      <summary><h3 style="display:inline;">Cross-context dependencies <span class="count">${deps.length}</span></h3></summary>
       <table>
         <thead><tr><th>From</th><th></th><th>To</th><th>Confidence</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
-    </div>`;
+    </details>`;
 }
 
 function renderContexts(items) {
@@ -94,9 +118,6 @@ function renderContexts(items) {
 
   contextsEl.innerHTML = '';
   for (const item of items) {
-    const card = document.createElement('div');
-    card.className = 'card';
-
     const status = item.status || item.Status;
     const kind = item.kind || item.Kind;
     const name = item.name || item.Name;
@@ -121,11 +142,21 @@ function renderContexts(items) {
         <div>${escapeHtml(e.redactedExcerpt || e.RedactedExcerpt || '(no excerpt)')}</div>
       </div>`).join('');
 
-    card.innerHTML = `
-      <h3>${escapeHtml(name)}
-        <span class="badge ${kindBadgeClass(kind)}">${kind}</span>
-        <span class="badge ${statusBadgeClass(status)}">${status}</span>
-      </h3>
+    const card = document.createElement('details');
+    card.className = 'card-item';
+
+    const summary = document.createElement('summary');
+    summary.innerHTML = `
+      <strong>${escapeHtml(name)}</strong>
+      <span class="badge ${kindBadgeClass(kind)}">${kind}</span>
+      <span class="badge ${statusBadgeClass(status)}">${status}</span>
+      <span class="muted"> · ${memberCount} members · confidence ${confidence?.toFixed ? confidence.toFixed(2) : confidence}</span>
+    `;
+    card.appendChild(summary);
+
+    const detail = document.createElement('div');
+    detail.className = 'card-detail';
+    detail.innerHTML = `
       <div><strong>Confidence:</strong> ${confidence?.toFixed ? confidence.toFixed(2) : confidence}</div>
       <div><strong>Seeding heuristics:</strong> ${escapeHtml(seedingRule)}</div>
       <div><strong>Members:</strong> ${memberCount} (${ownerCount} owner-role)</div>
@@ -133,6 +164,7 @@ function renderContexts(items) {
       <div><strong>Evidence / citations:</strong></div>
       ${evidenceHtml || '<p class="empty">No evidence attached.</p>'}
     `;
+    card.appendChild(detail);
 
     contextsEl.appendChild(card);
   }

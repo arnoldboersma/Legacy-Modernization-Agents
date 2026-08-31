@@ -6582,6 +6582,52 @@ app.MapGet("/api/discovery/runs/{runId}/contexts", async (string runId, CobolToQ
 	return Results.Ok(new { contexts = items, dependencies });
 });
 
+app.MapGet("/api/discovery/runs/{runId}/integrations", async (string runId, CobolToQuarkusMigration.Discovery.DiscoveryService svc) =>
+{
+	var integrations = await svc.GetIntegrationsAsync(runId);
+
+	var items = new List<object>();
+	foreach (var integration in integrations.OrderBy(i => i.Classification).ThenBy(i => i.Category))
+	{
+		var evidence = await svc.GetEvidenceByIdsAsync(integration.EvidenceIds);
+
+		items.Add(new
+		{
+			integration.IntegrationId,
+			Category = integration.Category.ToString(),
+			Classification = integration.Classification.ToString(),
+			Direction = integration.Direction.ToString(),
+			integration.TriggerOrCaller,
+			integration.ProtocolOrMechanism,
+			integration.LogicalTarget,
+			integration.ConfigurationKeySemantics,
+			integration.RedactedContractShape,
+			integration.AuthenticationSemantics,
+			integration.ReliabilityBehavior,
+			integration.OwningContextCandidateId,
+			integration.Confidence,
+			integration.ClassificationRule,
+			integration.BlindSpots,
+			integration.RequiresReview,
+			Evidence = evidence.Select(e => new
+			{
+				e.EvidenceId,
+				Type = e.Type.ToString(),
+				e.RedactedExcerpt,
+				e.WasRedacted,
+				e.RedactionSummary
+			}),
+			integration.CreatedAtUtc
+		});
+	}
+
+	var byClassification = integrations
+		.GroupBy(i => i.Classification.ToString())
+		.ToDictionary(g => g.Key, g => g.Count());
+
+	return Results.Ok(new { integrations = items, countsByClassification = byClassification });
+});
+
 app.Run();
 
 /// <summary>Request body for Discovery review-queue decision endpoints.</summary>

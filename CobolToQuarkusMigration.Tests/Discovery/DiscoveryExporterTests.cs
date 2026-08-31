@@ -91,4 +91,48 @@ public sealed class DiscoveryExporterTests : IDisposable
         var json = await File.ReadAllTextAsync(jsonPath);
         json.Should().Contain("\"status\": \"Rejected\"");
     }
+
+    [Fact]
+    public async Task ExportIntegrationInventoryAsync_GroupsByClassification_AndIncludesAllRequiredFields()
+    {
+        var run = await _service.StartRunAsync("PlanBoard pilot", "/tmp", "rev1", Array.Empty<string>(), Array.Empty<string>(), "Static source only");
+        var artifact = await _service.AppendArtifactAsync(run.RunId, "Data/ApplicationContext.cs", "CSharp", "h1");
+
+        var runtimeCandidate = new CobolToQuarkusMigration.Discovery.Integrations.IntegrationCandidate(
+            IntegrationCategory.DatabaseOrSharedStore, IntegrationClassification.RuntimeApplication, IntegrationDirection.Outbound,
+            "ApplicationContext", "EF Core / SQL Server", "ApplicationContext", null, null, null, null,
+            0.9, "EfDbContextBaseType", Array.Empty<string>(), false, artifact.Path,
+            new[] { new CobolToQuarkusMigration.Discovery.Integrations.IntegrationEvidenceCitation("EfDbContextBaseType", "Data/ApplicationContext.cs:L1", "DbContext base type.") });
+
+        var platformCandidate = new CobolToQuarkusMigration.Discovery.Integrations.IntegrationCandidate(
+            IntegrationCategory.IdentityOrAuthorization, IntegrationClassification.PlatformIdentity, IntegrationDirection.Outbound,
+            "Data/ApplicationContext.cs", "Microsoft.Graph", "Microsoft.Graph", null, null, "Microsoft Entra ID / Microsoft Graph.", null,
+            0.85, "IdentitySdkUsingDirective", Array.Empty<string>(), false, artifact.Path,
+            new[] { new CobolToQuarkusMigration.Discovery.Integrations.IntegrationEvidenceCitation("IdentitySdkUsingDirective", "Data/ApplicationContext.cs:L1", "'using Microsoft.Graph;' declared.") });
+
+        await _service.AppendIntegrationsAsync(
+            run.RunId,
+            new[] { (runtimeCandidate, (string?)artifact.ArtifactId), (platformCandidate, (string?)artifact.ArtifactId) },
+            producerVersion: "test-integration-classifier-v1");
+
+        var jsonPath = await _exporter.ExportIntegrationInventoryAsync(run.RunId, _outputDir);
+        var json = await File.ReadAllTextAsync(jsonPath);
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+
+        root.GetProperty("totalIntegrations").GetInt32().Should().Be(2);
+        var byClassification = root.GetProperty("byClassification");
+        byClassification.TryGetProperty("RuntimeApplication", out var runtimeArray).Should().BeTrue();
+        byClassification.TryGetProperty("PlatformIdentity", out var platformArray).Should().BeTrue();
+        runtimeArray.GetArrayLength().Should().Be(1);
+        platformArray.GetArrayLength().Should().Be(1);
+
+        var runtimeEntry = runtimeArray[0];
+        runtimeEntry.GetProperty("category").GetString().Should().Be("DatabaseOrSharedStore");
+        runtimeEntry.GetProperty("requiresReview").GetBoolean().Should().BeFalse();
+        runtimeEntry.GetProperty("evidenceIds").GetArrayLength().Should().BeGreaterThan(0);
+
+        var platformEntry = platformArray[0];
+        platformEntry.GetProperty("authenticationSemantics").GetString().Should().Contain("Entra");
+    }
 }

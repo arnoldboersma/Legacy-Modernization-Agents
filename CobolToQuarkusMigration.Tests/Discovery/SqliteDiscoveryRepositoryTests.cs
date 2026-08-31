@@ -256,6 +256,195 @@ public class SqliteDiscoveryRepositoryTests : IDisposable
         assignments.Should().HaveCount(2, "role assignments are append-only, never overwritten");
     }
 
+    [Fact]
+    public async Task AppendIntegrationAsync_RoundTripsAllFieldsIncludingBlindSpotsAndOwningContext()
+    {
+        await Repository.InitializeAsync();
+        var run = NewRun();
+        await Repository.AppendRunAsync(run);
+
+        await Repository.AppendProvenanceAsync(new Provenance
+        {
+            ProvenanceId = "PROV-INTG-1",
+            RunId = run.RunId,
+            ProducerKind = "DeterministicExtractor",
+            ProducerVersion = "test-harness",
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+        });
+
+        await Repository.AppendContextCandidateAsync(new ContextCandidate
+        {
+            ContextCandidateId = "CTX-1",
+            RunId = run.RunId,
+            Name = "Worker",
+            Kind = ContextCandidateKind.BusinessContext,
+            Status = ReviewStatus.Candidate,
+            Confidence = 0.5,
+            EvidenceIds = Array.Empty<string>(),
+            SeedingRule = "test-harness",
+            ProvenanceId = "PROV-INTG-1",
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+        });
+
+        var integration = new Integration
+        {
+            IntegrationId = "INTG-1",
+            RunId = run.RunId,
+            Category = IntegrationCategory.ScheduledOrBackgroundProcess,
+            Classification = IntegrationClassification.Delivery,
+            Direction = IntegrationDirection.Outbound,
+            TriggerOrCaller = "Host scheduler / hosted service lifecycle",
+            ProtocolOrMechanism = "BackgroundService / IHostedService",
+            LogicalTarget = "Worker",
+            ConfigurationKeySemantics = null,
+            RedactedContractShape = null,
+            AuthenticationSemantics = null,
+            ReliabilityBehavior = null,
+            OwningContextCandidateId = "CTX-1",
+            EvidenceIds = new[] { "EVD-1" },
+            Confidence = 0.6,
+            ClassificationRule = "BackgroundServiceBaseTypeWithPathBasedDeliverySplit",
+            BlindSpots = new[] { "Delivery-vs-runtime classification is path-based, not an authoritative signal." },
+            RequiresReview = true,
+            ProvenanceId = "PROV-INTG-1",
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+        };
+
+        await Repository.AppendIntegrationAsync(integration);
+
+        var byRun = await Repository.GetIntegrationsAsync(run.RunId);
+        var byId = await Repository.GetIntegrationAsync(integration.IntegrationId);
+
+        byRun.Should().ContainSingle();
+        byId.Should().NotBeNull();
+        byId!.Category.Should().Be(IntegrationCategory.ScheduledOrBackgroundProcess);
+        byId.Classification.Should().Be(IntegrationClassification.Delivery);
+        byId.OwningContextCandidateId.Should().Be("CTX-1");
+        byId.EvidenceIds.Should().BeEquivalentTo(new[] { "EVD-1" });
+        byId.BlindSpots.Should().ContainSingle();
+        byId.RequiresReview.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task AppendIntegrationAsync_IsAppendOnly_MultipleIntegrationsForSameRunCoexist()
+    {
+        await Repository.InitializeAsync();
+        var run = NewRun();
+        await Repository.AppendRunAsync(run);
+
+        await Repository.AppendProvenanceAsync(new Provenance
+        {
+            ProvenanceId = "PROV-INTG-2",
+            RunId = run.RunId,
+            ProducerKind = "DeterministicExtractor",
+            ProducerVersion = "test-harness",
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+        });
+
+        for (var i = 1; i <= 2; i++)
+        {
+            await Repository.AppendIntegrationAsync(new Integration
+            {
+                IntegrationId = $"INTG-2-{i}",
+                RunId = run.RunId,
+                Category = IntegrationCategory.HttpApi,
+                Classification = IntegrationClassification.RuntimeApplication,
+                Direction = IntegrationDirection.Inbound,
+                TriggerOrCaller = "External HTTP client",
+                ProtocolOrMechanism = "HTTP/REST",
+                LogicalTarget = "WidgetsController",
+                ConfigurationKeySemantics = null,
+                RedactedContractShape = null,
+                AuthenticationSemantics = null,
+                ReliabilityBehavior = null,
+                OwningContextCandidateId = null,
+                EvidenceIds = Array.Empty<string>(),
+                Confidence = 0.9,
+                ClassificationRule = "ControllerBaseTypeOrRouteAttribute",
+                BlindSpots = Array.Empty<string>(),
+                RequiresReview = false,
+                ProvenanceId = "PROV-INTG-2",
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+            });
+        }
+
+        var integrations = await Repository.GetIntegrationsAsync(run.RunId);
+        integrations.Should().HaveCount(2, "integrations are append-only, never overwritten");
+    }
+
+    [Fact]
+    public async Task AppendIntegrationLinkAsync_RoundTripsLinkedRecordKindAndId()
+    {
+        await Repository.InitializeAsync();
+        var run = NewRun();
+        await Repository.AppendRunAsync(run);
+
+        await Repository.AppendProvenanceAsync(new Provenance
+        {
+            ProvenanceId = "PROV-INTG-3",
+            RunId = run.RunId,
+            ProducerKind = "DeterministicExtractor",
+            ProducerVersion = "test-harness",
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+        });
+
+        await Repository.AppendContextCandidateAsync(new ContextCandidate
+        {
+            ContextCandidateId = "CTX-2",
+            RunId = run.RunId,
+            Name = "Data",
+            Kind = ContextCandidateKind.BusinessContext,
+            Status = ReviewStatus.Candidate,
+            Confidence = 0.5,
+            EvidenceIds = Array.Empty<string>(),
+            SeedingRule = "test-harness",
+            ProvenanceId = "PROV-INTG-3",
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+        });
+
+        var integration = new Integration
+        {
+            IntegrationId = "INTG-3",
+            RunId = run.RunId,
+            Category = IntegrationCategory.DatabaseOrSharedStore,
+            Classification = IntegrationClassification.RuntimeApplication,
+            Direction = IntegrationDirection.Outbound,
+            TriggerOrCaller = "ApplicationContext",
+            ProtocolOrMechanism = "EF Core / SQL Server",
+            LogicalTarget = "ApplicationContext",
+            ConfigurationKeySemantics = null,
+            RedactedContractShape = null,
+            AuthenticationSemantics = null,
+            ReliabilityBehavior = null,
+            OwningContextCandidateId = "CTX-2",
+            EvidenceIds = Array.Empty<string>(),
+            Confidence = 0.9,
+            ClassificationRule = "EfDbContextBaseType",
+            BlindSpots = Array.Empty<string>(),
+            RequiresReview = false,
+            ProvenanceId = "PROV-INTG-3",
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+        };
+        await Repository.AppendIntegrationAsync(integration);
+
+        var link = new IntegrationLink
+        {
+            IntegrationLinkId = "ILNK-1",
+            RunId = run.RunId,
+            IntegrationId = integration.IntegrationId,
+            LinkedRecordKind = IntegrationLinkedRecordKind.ContextCandidate,
+            LinkedRecordId = "CTX-2",
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+        };
+        await Repository.AppendIntegrationLinkAsync(link);
+
+        var links = await Repository.GetIntegrationLinksAsync(integration.IntegrationId);
+
+        links.Should().ContainSingle();
+        links[0].LinkedRecordKind.Should().Be(IntegrationLinkedRecordKind.ContextCandidate);
+        links[0].LinkedRecordId.Should().Be("CTX-2");
+    }
+
     private static DiscoveryRun NewRun() => new()
     {
         RunId = $"RUN-{Guid.NewGuid():N}"[..12].ToUpperInvariant(),

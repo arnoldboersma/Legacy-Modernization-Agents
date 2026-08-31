@@ -106,6 +106,63 @@ public sealed class DiscoveryExporter
         return (markdownPath, jsonPath);
     }
 
+    /// <summary>
+    /// Exports a run's full integration inventory (design doc §7, issue #6) to JSON, grouped by
+    /// <see cref="IntegrationClassification"/> so runtime application, platform/identity,
+    /// observability, and delivery dependencies are distinguishable by consumers without
+    /// re-deriving the classification. Unlike <see cref="ExportFindingAsync"/>, integrations have
+    /// no publish/reject review lifecycle (they are deterministic presence facts, like role
+    /// assignments), so every integration recorded for the run is included.
+    /// </summary>
+    public async Task<string> ExportIntegrationInventoryAsync(
+        string runId,
+        string outputDirectory,
+        CancellationToken cancellationToken = default)
+    {
+        var run = await _repository.GetRunAsync(runId, cancellationToken)
+            ?? throw new InvalidOperationException($"Run not found: {runId}");
+        var integrations = await _repository.GetIntegrationsAsync(runId, cancellationToken);
+
+        Directory.CreateDirectory(outputDirectory);
+        var jsonPath = Path.Combine(outputDirectory, $"{runId}-integrations.json");
+
+        var byClassification = integrations
+            .GroupBy(i => i.Classification)
+            .OrderBy(g => g.Key)
+            .ToDictionary(
+                g => g.Key.ToString(),
+                g => g.Select(i => new IntegrationExport(
+                    i.IntegrationId,
+                    i.Category.ToString(),
+                    i.Classification.ToString(),
+                    i.Direction.ToString(),
+                    i.TriggerOrCaller,
+                    i.ProtocolOrMechanism,
+                    i.LogicalTarget,
+                    i.ConfigurationKeySemantics,
+                    i.RedactedContractShape,
+                    i.AuthenticationSemantics,
+                    i.ReliabilityBehavior,
+                    i.OwningContextCandidateId,
+                    i.EvidenceIds,
+                    i.Confidence,
+                    i.ClassificationRule,
+                    i.BlindSpots,
+                    i.RequiresReview,
+                    i.CreatedAtUtc)).ToList());
+
+        var exportModel = new IntegrationInventoryExport(
+            ContractVersion,
+            runId,
+            run.Subject,
+            DateTimeOffset.UtcNow,
+            integrations.Count,
+            byClassification);
+
+        await File.WriteAllTextAsync(jsonPath, JsonSerializer.Serialize(exportModel, JsonOptions), cancellationToken);
+        return jsonPath;
+    }
+
     private static string RenderMarkdown(FindingExport export)
     {
         var sb = new StringBuilder();
@@ -214,4 +271,32 @@ public sealed class DiscoveryExporter
         double Confidence,
         string ClassificationRule,
         bool RequiresReview);
+
+    private sealed record IntegrationInventoryExport(
+        string ContractVersion,
+        string RunId,
+        string Subject,
+        DateTimeOffset ExportedAtUtc,
+        int TotalIntegrations,
+        IReadOnlyDictionary<string, List<IntegrationExport>> ByClassification);
+
+    private sealed record IntegrationExport(
+        string IntegrationId,
+        string Category,
+        string Classification,
+        string Direction,
+        string TriggerOrCaller,
+        string ProtocolOrMechanism,
+        string LogicalTarget,
+        string? ConfigurationKeySemantics,
+        string? RedactedContractShape,
+        string? AuthenticationSemantics,
+        string? ReliabilityBehavior,
+        string? OwningContextCandidateId,
+        IReadOnlyList<string> EvidenceIds,
+        double Confidence,
+        string ClassificationRule,
+        IReadOnlyList<string> BlindSpots,
+        bool RequiresReview,
+        DateTimeOffset CreatedAtUtc);
 }

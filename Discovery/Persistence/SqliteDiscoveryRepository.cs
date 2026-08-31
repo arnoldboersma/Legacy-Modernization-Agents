@@ -956,4 +956,157 @@ FROM context_dependency_edges WHERE run_id = $runId ORDER BY created_at_utc;";
         Confidence = reader.GetDouble(5),
         CreatedAtUtc = DateTimeOffset.Parse(reader.GetString(6)),
     };
+
+    // -------------------------------------------------------------------------------------
+    // Discovery Factory phase 6 (issue #6): integration inventory and topology links.
+    // -------------------------------------------------------------------------------------
+
+    public async Task AppendIntegrationAsync(Integration integration, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+INSERT INTO integrations
+    (integration_id, run_id, category, classification, direction, trigger_or_caller,
+     protocol_or_mechanism, logical_target, configuration_key_semantics, redacted_contract_shape,
+     authentication_semantics, reliability_behavior, owning_context_candidate_id,
+     evidence_ids_json, confidence, classification_rule, blind_spots_json, requires_review,
+     provenance_id, created_at_utc)
+VALUES
+    ($integrationId, $runId, $category, $classification, $direction, $triggerOrCaller,
+     $protocolOrMechanism, $logicalTarget, $configurationKeySemantics, $redactedContractShape,
+     $authenticationSemantics, $reliabilityBehavior, $owningContextCandidateId,
+     $evidenceIdsJson, $confidence, $classificationRule, $blindSpotsJson, $requiresReview,
+     $provenanceId, $createdAtUtc);";
+        command.Parameters.AddWithValue("$integrationId", integration.IntegrationId);
+        command.Parameters.AddWithValue("$runId", integration.RunId);
+        command.Parameters.AddWithValue("$category", integration.Category.ToString());
+        command.Parameters.AddWithValue("$classification", integration.Classification.ToString());
+        command.Parameters.AddWithValue("$direction", integration.Direction.ToString());
+        command.Parameters.AddWithValue("$triggerOrCaller", integration.TriggerOrCaller);
+        command.Parameters.AddWithValue("$protocolOrMechanism", integration.ProtocolOrMechanism);
+        command.Parameters.AddWithValue("$logicalTarget", integration.LogicalTarget);
+        command.Parameters.AddWithValue("$configurationKeySemantics", (object?)integration.ConfigurationKeySemantics ?? DBNull.Value);
+        command.Parameters.AddWithValue("$redactedContractShape", (object?)integration.RedactedContractShape ?? DBNull.Value);
+        command.Parameters.AddWithValue("$authenticationSemantics", (object?)integration.AuthenticationSemantics ?? DBNull.Value);
+        command.Parameters.AddWithValue("$reliabilityBehavior", (object?)integration.ReliabilityBehavior ?? DBNull.Value);
+        command.Parameters.AddWithValue("$owningContextCandidateId", (object?)integration.OwningContextCandidateId ?? DBNull.Value);
+        command.Parameters.AddWithValue("$evidenceIdsJson", JsonSerializer.Serialize(integration.EvidenceIds, JsonOptions));
+        command.Parameters.AddWithValue("$confidence", integration.Confidence);
+        command.Parameters.AddWithValue("$classificationRule", integration.ClassificationRule);
+        command.Parameters.AddWithValue("$blindSpotsJson", JsonSerializer.Serialize(integration.BlindSpots, JsonOptions));
+        command.Parameters.AddWithValue("$requiresReview", integration.RequiresReview ? 1 : 0);
+        command.Parameters.AddWithValue("$provenanceId", integration.ProvenanceId);
+        command.Parameters.AddWithValue("$createdAtUtc", integration.CreatedAtUtc.ToString("O"));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<Integration>> GetIntegrationsAsync(string runId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+SELECT integration_id, run_id, category, classification, direction, trigger_or_caller,
+       protocol_or_mechanism, logical_target, configuration_key_semantics, redacted_contract_shape,
+       authentication_semantics, reliability_behavior, owning_context_candidate_id,
+       evidence_ids_json, confidence, classification_rule, blind_spots_json, requires_review,
+       provenance_id, created_at_utc
+FROM integrations WHERE run_id = $runId ORDER BY created_at_utc;";
+        command.Parameters.AddWithValue("$runId", runId);
+        var results = new List<Integration>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            results.Add(ReadIntegration(reader));
+        }
+        return results;
+    }
+
+    public async Task<Integration?> GetIntegrationAsync(string integrationId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+SELECT integration_id, run_id, category, classification, direction, trigger_or_caller,
+       protocol_or_mechanism, logical_target, configuration_key_semantics, redacted_contract_shape,
+       authentication_semantics, reliability_behavior, owning_context_candidate_id,
+       evidence_ids_json, confidence, classification_rule, blind_spots_json, requires_review,
+       provenance_id, created_at_utc
+FROM integrations WHERE integration_id = $integrationId;";
+        command.Parameters.AddWithValue("$integrationId", integrationId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadIntegration(reader) : null;
+    }
+
+    private static Integration ReadIntegration(SqliteDataReader reader) => new()
+    {
+        IntegrationId = reader.GetString(0),
+        RunId = reader.GetString(1),
+        Category = Enum.Parse<IntegrationCategory>(reader.GetString(2)),
+        Classification = Enum.Parse<IntegrationClassification>(reader.GetString(3)),
+        Direction = Enum.Parse<IntegrationDirection>(reader.GetString(4)),
+        TriggerOrCaller = reader.GetString(5),
+        ProtocolOrMechanism = reader.GetString(6),
+        LogicalTarget = reader.GetString(7),
+        ConfigurationKeySemantics = reader.IsDBNull(8) ? null : reader.GetString(8),
+        RedactedContractShape = reader.IsDBNull(9) ? null : reader.GetString(9),
+        AuthenticationSemantics = reader.IsDBNull(10) ? null : reader.GetString(10),
+        ReliabilityBehavior = reader.IsDBNull(11) ? null : reader.GetString(11),
+        OwningContextCandidateId = reader.IsDBNull(12) ? null : reader.GetString(12),
+        EvidenceIds = JsonSerializer.Deserialize<List<string>>(reader.GetString(13), JsonOptions) ?? new List<string>(),
+        Confidence = reader.GetDouble(14),
+        ClassificationRule = reader.GetString(15),
+        BlindSpots = JsonSerializer.Deserialize<List<string>>(reader.GetString(16), JsonOptions) ?? new List<string>(),
+        RequiresReview = reader.GetInt32(17) != 0,
+        ProvenanceId = reader.GetString(18),
+        CreatedAtUtc = DateTimeOffset.Parse(reader.GetString(19)),
+    };
+
+    public async Task AppendIntegrationLinkAsync(IntegrationLink link, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+INSERT INTO integration_links
+    (integration_link_id, run_id, integration_id, linked_record_kind, linked_record_id, created_at_utc)
+VALUES
+    ($integrationLinkId, $runId, $integrationId, $linkedRecordKind, $linkedRecordId, $createdAtUtc);";
+        command.Parameters.AddWithValue("$integrationLinkId", link.IntegrationLinkId);
+        command.Parameters.AddWithValue("$runId", link.RunId);
+        command.Parameters.AddWithValue("$integrationId", link.IntegrationId);
+        command.Parameters.AddWithValue("$linkedRecordKind", link.LinkedRecordKind.ToString());
+        command.Parameters.AddWithValue("$linkedRecordId", link.LinkedRecordId);
+        command.Parameters.AddWithValue("$createdAtUtc", link.CreatedAtUtc.ToString("O"));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<IntegrationLink>> GetIntegrationLinksAsync(string integrationId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+SELECT integration_link_id, run_id, integration_id, linked_record_kind, linked_record_id, created_at_utc
+FROM integration_links WHERE integration_id = $integrationId ORDER BY created_at_utc;";
+        command.Parameters.AddWithValue("$integrationId", integrationId);
+        var results = new List<IntegrationLink>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            results.Add(new IntegrationLink
+            {
+                IntegrationLinkId = reader.GetString(0),
+                RunId = reader.GetString(1),
+                IntegrationId = reader.GetString(2),
+                LinkedRecordKind = Enum.Parse<IntegrationLinkedRecordKind>(reader.GetString(3)),
+                LinkedRecordId = reader.GetString(4),
+                CreatedAtUtc = DateTimeOffset.Parse(reader.GetString(5)),
+            });
+        }
+        return results;
+    }
 }
