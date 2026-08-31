@@ -5,6 +5,7 @@ using CobolToQuarkusMigration.Discovery;
 using CobolToQuarkusMigration.Discovery.Export;
 using CobolToQuarkusMigration.Discovery.Models;
 using CobolToQuarkusMigration.Discovery.Persistence;
+using CobolToQuarkusMigration.Discovery.Roles;
 using Microsoft.Extensions.Logging;
 
 namespace CobolToQuarkusMigration.Cli;
@@ -23,6 +24,7 @@ public static class DiscoveryCommand
 
         root.AddCommand(BuildStartRunCommand(loggerFactory));
         root.AddCommand(BuildSeedDemoCommand(loggerFactory));
+        root.AddCommand(BuildClassifyRolesCommand(loggerFactory));
         root.AddCommand(BuildExportCommand(loggerFactory));
 
         return root;
@@ -176,6 +178,89 @@ public static class DiscoveryCommand
             Console.Out.WriteLine($"Artifact: {artifact.ArtifactId} ({artifact.Path})");
             Console.Out.WriteLine($"Evidence: {evidence.EvidenceId} (redacted={evidence.WasRedacted})");
             Console.Out.WriteLine($"Candidate finding: {finding.FindingId} / revision {revision.FindingRevisionId} — {revision.Statement}");
+        }, runIdOption, sourceDirOption, databaseOption);
+
+        return cmd;
+    }
+
+    private static Command BuildClassifyRolesCommand(ILoggerFactory loggerFactory)
+    {
+        var cmd = new Command("classify-roles",
+            "Deterministically classify C# source under --source-dir into evidence-backed artifact roles " +
+            "(business, composition/DI, middleware, framework adapter, persistence, integration adapter, " +
+            "shared, generated, test, build tooling, unknown), appending role assignments and evidence to a run.");
+
+        var runIdOption = new Option<string?>("--run-id", "Existing run to append to. If omitted, a new run is declared automatically.");
+        cmd.AddOption(runIdOption);
+
+        var sourceDirOption = new Option<string>("--source-dir", "Directory containing the C# project source to classify (e.g. a PlanBoard project directory). Scanned recursively; bin/obj are always excluded.") { IsRequired = true };
+        cmd.AddOption(sourceDirOption);
+
+        var databaseOption = new Option<string>("--database", () => DefaultDatabasePath, "Path to the Discovery Factory SQLite database.");
+        cmd.AddOption(databaseOption);
+
+        cmd.SetHandler(async (string? runId, string sourceDir, string database) =>
+        {
+            var repository = CreateRepository(loggerFactory, database);
+            var service = new DiscoveryService(repository, loggerFactory.CreateLogger<DiscoveryService>());
+
+            if (!Directory.Exists(sourceDir))
+            {
+                Console.Error.WriteLine($"Source directory not found: {sourceDir}");
+                Environment.ExitCode = 2;
+                return;
+            }
+
+            DiscoveryRun run;
+            if (!string.IsNullOrWhiteSpace(runId))
+            {
+                await repository.InitializeAsync();
+                run = await repository.GetRunAsync(runId)
+                    ?? throw new InvalidOperationException($"Run not found: {runId}");
+            }
+            else
+            {
+                run = await service.StartRunAsync(
+                    subject: "PlanBoard artifact role classification (issue #8)",
+                    sourceLocator: Path.GetFullPath(sourceDir),
+                    sourceRevision: "local-working-tree",
+                    inclusions: new[] { sourceDir },
+                    exclusions: new[] { "bin/", "obj/" },
+                    evidenceBoundary: "Static C# source only (Roslyn syntax-tree parsing); no configuration, schema, or runtime logs.");
+            }
+
+            var files = Directory.EnumerateFiles(sourceDir, "*", SearchOption.AllDirectories)
+                .Where(f => !ArtifactRoleClassifier.IsExcludedBuildOutputPath(Path.GetRelativePath(sourceDir, f)))
+                .Where(f => f.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) ||
+                            f.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase) ||
+                            f.EndsWith(".sql", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            if (files.Count == 0)
+            {
+                Console.Error.WriteLine($"No classifiable files found under {sourceDir}");
+                Environment.ExitCode = 2;
+                return;
+            }
+
+            var artifacts = new List<(SourceArtifact Artifact, string SourceText)>();
+            foreach (var file in files)
+            {
+                var content = await File.ReadAllTextAsync(file);
+                var contentHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(content))).ToLowerInvariant();
+                var relativePath = Path.GetRelativePath(Directory.GetCurrentDirectory(), file);
+                var artifact = await service.AppendArtifactAsync(run.RunId, relativePath, "CSharp", contentHash, content.Length);
+                artifacts.Add((artifact, content));
+            }
+
+            var assignments = await service.ClassifyArtifactRolesAsync(run.RunId, artifacts, producerVersion: "ArtifactRoleClassifier/1.0");
+
+            Console.Out.WriteLine($"Run: {run.RunId}");
+            Console.Out.WriteLine($"Classified {artifacts.Count} artifact(s) into {assignments.Count} role assignment(s).");
+            foreach (var group in assignments.GroupBy(a => string.Join("+", a.Roles)).OrderBy(g => g.Key, StringComparer.Ordinal))
+            {
+                Console.Out.WriteLine($"  {group.Key}: {group.Count()}{(group.Any(a => a.RequiresReview) ? " (some require review)" : string.Empty)}");
+            }
         }, runIdOption, sourceDirOption, databaseOption);
 
         return cmd;

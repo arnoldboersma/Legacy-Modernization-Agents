@@ -44,4 +44,8 @@ public interface IDiscoveryRepository
     /// NeedsEvidence — i.e. the reviewer queue contents for that run.
     /// </summary>
     Task<IReadOnlyList<FindingRevision>> GetReviewQueueAsync(string runId, CancellationToken cancellationToken = default);
+
+    Task AppendRoleAssignmentAsync(RoleAssignment assignment, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<RoleAssignment>> GetRoleAssignmentsAsync(string runId, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<RoleAssignment>> GetRoleAssignmentsForArtifactAsync(string artifactId, CancellationToken cancellationToken = default);
 }

@@ -606,5 +606,28 @@ not change the deferred decisions in §12.
   identity (`DiscoveryService.DefaultReviewerIdentity`) with no authentication or role
   management; this is recorded on every review decision but is not currently validated
   against any identity provider.
+- **Phase 4 (issue #8) runs against the real PlanBoard checkout, not a substitution.**
+  Unlike the COBOL substitution above, the real PlanBoard repository (a C#/.NET/EF Core
+  solution) was confirmed accessible on the development machine at a local path outside
+  this repository and is read in place via `discovery classify-roles --source-dir <path>`;
+  its source is never copied into this repository. Only governed Discovery Factory
+  records (role assignments, evidence citing PlanBoard file paths and content hashes,
+  provenance) are persisted to `Data/discovery.db`. Role classification
+  (`Discovery/Roles/ArtifactRoleClassifier.cs`) parses each `.cs` file with the Roslyn
+  `CSharpSyntaxTree` API in syntax-tree-only mode — no `CSharpCompilation`/`SemanticModel`
+  is built, so there is no cross-file symbol resolution. Rules therefore match on syntactic
+  shape (base type names, attribute names, invocation names, `using` directives, file path)
+  rather than resolved symbols; this is sufficient for the deterministic, evidence-cited
+  rules in §5.1/§5.2 but means the `Shared` fan-in heuristic (types referenced by
+  identifier from more than one namespace) is a textual proxy, not verified symbol binding.
+  Full semantic/compilation-based analysis remains deferred per §12.
+- **Business is a fallback role, never inferred as primary from mixed/absent signals.**
+  `ArtifactRoleClassifier` only assigns `Business` when no other rule fires and the type
+  has at least one member with an executable body; a type with zero matching rules and no
+  executable members is `Unknown` instead. Any assignment that is `Unknown`, or that mixes
+  `Business` with a non-business role, or that carries more than one distinct
+  non-business role, sets `RequiresReview = true` and receives reduced confidence — the
+  classifier never collapses conflicting evidence into a single guessed role (issue #8
+  scope item 3).
 
 

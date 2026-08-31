@@ -149,6 +149,113 @@ public class SqliteDiscoveryRepositoryTests : IDisposable
         queue.Should().NotContain(r => r.FindingId == "F-B");
     }
 
+    [Fact]
+    public async Task AppendRoleAssignmentAsync_RoundTripsRolesEvidenceAndReviewFlag()
+    {
+        await Repository.InitializeAsync();
+        var run = NewRun();
+        await Repository.AppendRunAsync(run);
+
+        var artifact = new SourceArtifact
+        {
+            ArtifactId = "ART-ROLE-1",
+            RunId = run.RunId,
+            Path = "Domain/Employee.cs",
+            Language = "CSharp",
+            ContentHash = "deadbeef",
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+        };
+        await Repository.AppendArtifactAsync(artifact);
+
+        await Repository.AppendProvenanceAsync(new Provenance
+        {
+            ProvenanceId = "PROV-ROLE-1",
+            RunId = run.RunId,
+            ProducerKind = "DeterministicExtractor",
+            ProducerVersion = "test-harness",
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+        });
+
+        var assignment = new RoleAssignment
+        {
+            RoleAssignmentId = "ROLE-1",
+            RunId = run.RunId,
+            ArtifactId = artifact.ArtifactId,
+            SymbolLocator = "App.Domain.Employee",
+            Roles = new[] { ArtifactRoleTag.Business, ArtifactRoleTag.Persistence },
+            Confidence = 0.6,
+            EvidenceIds = new[] { "EVD-1", "EVD-2" },
+            ClassificationRule = "PersistenceAttribute;BusinessFallback",
+            RequiresReview = true,
+            ProvenanceId = "PROV-ROLE-1",
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+        };
+
+        await Repository.AppendRoleAssignmentAsync(assignment);
+
+        var byRun = await Repository.GetRoleAssignmentsAsync(run.RunId);
+        var byArtifact = await Repository.GetRoleAssignmentsForArtifactAsync(artifact.ArtifactId);
+
+        byRun.Should().ContainSingle();
+        byArtifact.Should().ContainSingle();
+
+        var roundTripped = byRun[0];
+        roundTripped.Roles.Should().BeEquivalentTo(new[] { ArtifactRoleTag.Business, ArtifactRoleTag.Persistence });
+        roundTripped.EvidenceIds.Should().BeEquivalentTo(new[] { "EVD-1", "EVD-2" });
+        roundTripped.RequiresReview.Should().BeTrue();
+        roundTripped.Confidence.Should().Be(0.6);
+        roundTripped.ClassificationRule.Should().Be("PersistenceAttribute;BusinessFallback");
+    }
+
+    [Fact]
+    public async Task AppendRoleAssignmentAsync_IsAppendOnly_MultipleAssignmentsForSameArtifactCoexist()
+    {
+        await Repository.InitializeAsync();
+        var run = NewRun();
+        await Repository.AppendRunAsync(run);
+
+        var artifact = new SourceArtifact
+        {
+            ArtifactId = "ART-ROLE-2",
+            RunId = run.RunId,
+            Path = "Domain/Widget.cs",
+            Language = "CSharp",
+            ContentHash = "cafebabe",
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+        };
+        await Repository.AppendArtifactAsync(artifact);
+
+        await Repository.AppendProvenanceAsync(new Provenance
+        {
+            ProvenanceId = "PROV-ROLE-2",
+            RunId = run.RunId,
+            ProducerKind = "DeterministicExtractor",
+            ProducerVersion = "test-harness",
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+        });
+
+        for (var i = 1; i <= 2; i++)
+        {
+            await Repository.AppendRoleAssignmentAsync(new RoleAssignment
+            {
+                RoleAssignmentId = $"ROLE-2-{i}",
+                RunId = run.RunId,
+                ArtifactId = artifact.ArtifactId,
+                SymbolLocator = "App.Domain.Widget",
+                Roles = new[] { ArtifactRoleTag.Unknown },
+                Confidence = 0.2,
+                EvidenceIds = Array.Empty<string>(),
+                ClassificationRule = "NoRuleMatched",
+                RequiresReview = true,
+                ProvenanceId = "PROV-ROLE-2",
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+            });
+        }
+
+        var assignments = await Repository.GetRoleAssignmentsForArtifactAsync(artifact.ArtifactId);
+        assignments.Should().HaveCount(2, "role assignments are append-only, never overwritten");
+    }
+
     private static DiscoveryRun NewRun() => new()
     {
         RunId = $"RUN-{Guid.NewGuid():N}"[..12].ToUpperInvariant(),

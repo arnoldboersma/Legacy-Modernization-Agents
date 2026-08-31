@@ -191,4 +191,73 @@ public sealed class DiscoveryServiceTests : IDisposable
         var queueAfterDecision = await _service.GetReviewQueueAsync(run.RunId);
         queueAfterDecision.Should().NotContain(r => r.FindingId == finding.FindingId);
     }
+
+    [Fact]
+    public async Task ClassifyArtifactRolesAsync_AppendsRoleAssignmentsWithEvidenceAndProvenance()
+    {
+        var run = await _service.StartRunAsync("Subject", "/tmp", "rev1", Array.Empty<string>(), Array.Empty<string>(), "Static source only");
+
+        var businessArtifact = await _service.AppendArtifactAsync(run.RunId, "Domain/Calculator.cs", "CSharp", "hash1");
+        var controllerArtifact = await _service.AppendArtifactAsync(run.RunId, "Controllers/FooController.cs", "CSharp", "hash2");
+
+        var artifacts = new List<(SourceArtifact, string)>
+        {
+            (businessArtifact, "namespace App.Domain; public class Calculator { public int Add(int a, int b) => a + b; }"),
+            (controllerArtifact, "namespace App.Controllers; [Microsoft.AspNetCore.Mvc.ApiController] public class FooController : Microsoft.AspNetCore.Mvc.ControllerBase { [Microsoft.AspNetCore.Mvc.HttpGet] public string Get() => \"ok\"; }"),
+        };
+
+        var assignments = await _service.ClassifyArtifactRolesAsync(run.RunId, artifacts, producerVersion: "test-classifier-v1");
+
+        assignments.Should().HaveCount(2);
+        assignments.Should().Contain(a => a.ArtifactId == businessArtifact.ArtifactId && a.Roles.Contains(ArtifactRoleTag.Business));
+        assignments.Should().Contain(a => a.ArtifactId == controllerArtifact.ArtifactId && a.Roles.Contains(ArtifactRoleTag.FrameworkAdapter));
+
+        foreach (var assignment in assignments)
+        {
+            assignment.EvidenceIds.Should().NotBeEmpty();
+            assignment.ProvenanceId.Should().NotBeNullOrWhiteSpace();
+            assignment.ClassificationRule.Should().NotBeNullOrWhiteSpace();
+
+            var citedEvidence = await _service.GetEvidenceByIdsAsync(assignment.EvidenceIds);
+            citedEvidence.Should().HaveCount(assignment.EvidenceIds.Count);
+            citedEvidence.Should().OnlyContain(e => e.ArtifactId == assignment.ArtifactId);
+        }
+
+        var persisted = await _service.GetRoleAssignmentsAsync(run.RunId);
+        persisted.Should().HaveCount(2);
+    }
+
+    [Fact]
+    public async Task GetBusinessEligibleArtifactsAsync_ExcludesTechnicalMixedAndUnknownRoles()
+    {
+        var run = await _service.StartRunAsync("Subject", "/tmp", "rev1", Array.Empty<string>(), Array.Empty<string>(), "Static source only");
+
+        var businessArtifact = await _service.AppendArtifactAsync(run.RunId, "Domain/Calculator.cs", "CSharp", "h1");
+        var controllerArtifact = await _service.AppendArtifactAsync(run.RunId, "Controllers/FooController.cs", "CSharp", "h2");
+        var mixedArtifact = await _service.AppendArtifactAsync(run.RunId, "Domain/Employee.cs", "CSharp", "h3");
+        var unknownArtifact = await _service.AppendArtifactAsync(run.RunId, "Interfaces/IFoo.cs", "CSharp", "h4");
+
+        var artifacts = new List<(SourceArtifact, string)>
+        {
+            (businessArtifact, "namespace App.Domain; public class Calculator { public int Add(int a, int b) => a + b; }"),
+            (controllerArtifact, "namespace App.Controllers; [Microsoft.AspNetCore.Mvc.ApiController] public class FooController : Microsoft.AspNetCore.Mvc.ControllerBase { [Microsoft.AspNetCore.Mvc.HttpGet] public string Get() => \"ok\"; }"),
+            (mixedArtifact, "using Microsoft.EntityFrameworkCore; namespace App.Domain; [Table(\"Employees\")] public class Employee { public int CalculateTenure(System.DateTime hire, System.DateTime now) => now.Year - hire.Year; }"),
+            (unknownArtifact, "namespace App.Interfaces; public interface IFoo { System.Threading.Tasks.Task<int> GetAsync(); }"),
+        };
+
+        await _service.ClassifyArtifactRolesAsync(run.RunId, artifacts, producerVersion: "test-classifier-v1");
+
+        var eligible = await _service.GetBusinessEligibleArtifactsAsync(run.RunId);
+
+        eligible.Should().ContainSingle(a => a.ArtifactId == businessArtifact.ArtifactId);
+        eligible.Should().NotContain(a => a.ArtifactId == controllerArtifact.ArtifactId);
+        eligible.Should().NotContain(a => a.ArtifactId == mixedArtifact.ArtifactId);
+        eligible.Should().NotContain(a => a.ArtifactId == unknownArtifact.ArtifactId);
+
+        // Mixed/unknown assignments must remain visible in the full governed record set, never
+        // silently dropped -- they are only excluded from the LLM-prompt-eligible subset.
+        var all = await _service.GetRoleAssignmentsAsync(run.RunId);
+        all.Should().HaveCount(4);
+    }
 }
+

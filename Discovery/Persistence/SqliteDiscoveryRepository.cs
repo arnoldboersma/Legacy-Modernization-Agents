@@ -576,4 +576,85 @@ ORDER BY fr.created_at_utc;";
         }
         return results;
     }
+
+    public async Task AppendRoleAssignmentAsync(RoleAssignment assignment, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+INSERT INTO role_assignments
+    (role_assignment_id, run_id, artifact_id, symbol_locator, roles_json, confidence,
+     evidence_ids_json, classification_rule, requires_review, provenance_id, created_at_utc)
+VALUES
+    ($roleAssignmentId, $runId, $artifactId, $symbolLocator, $rolesJson, $confidence,
+     $evidenceIdsJson, $classificationRule, $requiresReview, $provenanceId, $createdAtUtc);";
+        command.Parameters.AddWithValue("$roleAssignmentId", assignment.RoleAssignmentId);
+        command.Parameters.AddWithValue("$runId", assignment.RunId);
+        command.Parameters.AddWithValue("$artifactId", assignment.ArtifactId);
+        command.Parameters.AddWithValue("$symbolLocator", assignment.SymbolLocator);
+        command.Parameters.AddWithValue("$rolesJson", JsonSerializer.Serialize(assignment.Roles.Select(r => r.ToString()), JsonOptions));
+        command.Parameters.AddWithValue("$confidence", assignment.Confidence);
+        command.Parameters.AddWithValue("$evidenceIdsJson", JsonSerializer.Serialize(assignment.EvidenceIds, JsonOptions));
+        command.Parameters.AddWithValue("$classificationRule", assignment.ClassificationRule);
+        command.Parameters.AddWithValue("$requiresReview", assignment.RequiresReview ? 1 : 0);
+        command.Parameters.AddWithValue("$provenanceId", assignment.ProvenanceId);
+        command.Parameters.AddWithValue("$createdAtUtc", assignment.CreatedAtUtc.ToString("O"));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<RoleAssignment>> GetRoleAssignmentsAsync(string runId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+SELECT role_assignment_id, run_id, artifact_id, symbol_locator, roles_json, confidence,
+       evidence_ids_json, classification_rule, requires_review, provenance_id, created_at_utc
+FROM role_assignments WHERE run_id = $runId ORDER BY created_at_utc;";
+        command.Parameters.AddWithValue("$runId", runId);
+        var results = new List<RoleAssignment>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            results.Add(ReadRoleAssignment(reader));
+        }
+        return results;
+    }
+
+    public async Task<IReadOnlyList<RoleAssignment>> GetRoleAssignmentsForArtifactAsync(string artifactId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+SELECT role_assignment_id, run_id, artifact_id, symbol_locator, roles_json, confidence,
+       evidence_ids_json, classification_rule, requires_review, provenance_id, created_at_utc
+FROM role_assignments WHERE artifact_id = $artifactId ORDER BY created_at_utc;";
+        command.Parameters.AddWithValue("$artifactId", artifactId);
+        var results = new List<RoleAssignment>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            results.Add(ReadRoleAssignment(reader));
+        }
+        return results;
+    }
+
+    private static RoleAssignment ReadRoleAssignment(SqliteDataReader reader) => new()
+    {
+        RoleAssignmentId = reader.GetString(0),
+        RunId = reader.GetString(1),
+        ArtifactId = reader.GetString(2),
+        SymbolLocator = reader.GetString(3),
+        Roles = (JsonSerializer.Deserialize<List<string>>(reader.GetString(4), JsonOptions) ?? new List<string>())
+            .Select(Enum.Parse<ArtifactRoleTag>)
+            .ToList(),
+        Confidence = reader.GetDouble(5),
+        EvidenceIds = JsonSerializer.Deserialize<List<string>>(reader.GetString(6), JsonOptions) ?? new List<string>(),
+        ClassificationRule = reader.GetString(7),
+        RequiresReview = reader.GetInt32(8) != 0,
+        ProvenanceId = reader.GetString(9),
+        CreatedAtUtc = DateTimeOffset.Parse(reader.GetString(10)),
+    };
 }

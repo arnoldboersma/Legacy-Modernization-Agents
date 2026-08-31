@@ -2,7 +2,6 @@ using System.Text;
 using System.Text.Json;
 using CobolToQuarkusMigration.Discovery.Models;
 using CobolToQuarkusMigration.Discovery.Persistence;
-
 namespace CobolToQuarkusMigration.Discovery.Export;
 
 /// <summary>
@@ -45,6 +44,17 @@ public sealed class DiscoveryExporter
         var evidence = await _repository.GetEvidenceByIdsAsync(revision.EvidenceIds, cancellationToken);
         var llmAssessment = await _repository.GetLlmAssessmentForRevisionAsync(findingRevisionId, cancellationToken);
 
+        // Role assignments are keyed by artifact, not by finding/evidence, so we resolve them via
+        // the distinct artifact IDs referenced by this revision's cited evidence (design doc §5.4:
+        // exports must surface role/RequiresReview context so consumers can tell business-eligible
+        // findings from technical/mixed/unknown ones without re-deriving it).
+        var artifactIds = evidence.Select(e => e.ArtifactId).Where(id => id is not null).Distinct().ToList();
+        var roleAssignments = new List<RoleAssignment>();
+        foreach (var artifactId in artifactIds)
+        {
+            roleAssignments.AddRange(await _repository.GetRoleAssignmentsForArtifactAsync(artifactId!, cancellationToken));
+        }
+
         // Review decisions are recorded against the revision they were made against, and each
         // decision produces a new status-only revision (append-only design — see
         // DiscoveryService.RecordDecisionAsync). To render a complete review history for this
@@ -80,7 +90,15 @@ public sealed class DiscoveryExporter
             decisions.Select(d => new ReviewDecisionExport(d.ReviewDecisionId, d.ReviewerIdentity, d.Decision.ToString(), d.Rationale, d.DecidedAtUtc)).ToList(),
             llmAssessment is null
                 ? null
-                : new LlmAssessmentExport(llmAssessment.ReviewPriority, llmAssessment.WhyExplanation, llmAssessment.ModelId));
+                : new LlmAssessmentExport(llmAssessment.ReviewPriority, llmAssessment.WhyExplanation, llmAssessment.ModelId),
+            roleAssignments.Select(r => new RoleAssignmentExport(
+                r.RoleAssignmentId,
+                r.ArtifactId,
+                r.SymbolLocator,
+                r.Roles.Select(role => role.ToString()).ToList(),
+                r.Confidence,
+                r.ClassificationRule,
+                r.RequiresReview)).ToList());
 
         await File.WriteAllTextAsync(jsonPath, JsonSerializer.Serialize(exportModel, JsonOptions), cancellationToken);
         await File.WriteAllTextAsync(markdownPath, RenderMarkdown(exportModel), cancellationToken);
@@ -149,6 +167,19 @@ public sealed class DiscoveryExporter
         }
         sb.AppendLine();
 
+        if (export.RoleAssignments.Count > 0)
+        {
+            sb.AppendLine("## Artifact roles");
+            sb.AppendLine();
+            sb.AppendLine("_Deterministic role classification of the source artifacts cited by this finding's evidence (design doc §5, §5.1). Non-business/mixed/unknown roles are excluded from LLM business-use-case prompts by default._");
+            sb.AppendLine();
+            foreach (var r in export.RoleAssignments)
+            {
+                sb.AppendLine($"- `{r.SymbolLocator}` — **{string.Join(", ", r.Roles)}** (confidence {r.Confidence.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture)}, rule: {r.ClassificationRule}){(r.RequiresReview ? " ⚠️ _requires review_" : string.Empty)}");
+            }
+            sb.AppendLine();
+        }
+
         return sb.ToString();
     }
 
@@ -166,11 +197,21 @@ public sealed class DiscoveryExporter
         DateTimeOffset CreatedAtUtc,
         IReadOnlyList<EvidenceExport> Evidence,
         IReadOnlyList<ReviewDecisionExport> ReviewDecisions,
-        LlmAssessmentExport? LlmAssessment);
+        LlmAssessmentExport? LlmAssessment,
+        IReadOnlyList<RoleAssignmentExport> RoleAssignments);
 
     private sealed record EvidenceExport(string EvidenceId, string Type, string Locator, bool WasRedacted);
 
     private sealed record ReviewDecisionExport(string ReviewDecisionId, string ReviewerIdentity, string Decision, string Rationale, DateTimeOffset DecidedAtUtc);
 
     private sealed record LlmAssessmentExport(double ReviewPriority, string WhyExplanation, string ModelId);
+
+    private sealed record RoleAssignmentExport(
+        string RoleAssignmentId,
+        string ArtifactId,
+        string SymbolLocator,
+        IReadOnlyList<string> Roles,
+        double Confidence,
+        string ClassificationRule,
+        bool RequiresReview);
 }
