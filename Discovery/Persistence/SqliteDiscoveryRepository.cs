@@ -367,6 +367,28 @@ VALUES ($findingId, $runId, $correlationKey, $createdAtUtc);";
         };
     }
 
+    public async Task<IReadOnlyList<Finding>> GetFindingsAsync(string runId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT finding_id, run_id, correlation_key, created_at_utc FROM findings WHERE run_id = $runId ORDER BY created_at_utc;";
+        command.Parameters.AddWithValue("$runId", runId);
+        var results = new List<Finding>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            results.Add(new Finding
+            {
+                FindingId = reader.GetString(0),
+                RunId = reader.GetString(1),
+                CorrelationKey = reader.IsDBNull(2) ? null : reader.GetString(2),
+                CreatedAtUtc = DateTimeOffset.Parse(reader.GetString(3)),
+            });
+        }
+        return results;
+    }
+
     public async Task AppendFindingRevisionAsync(FindingRevision revision, CancellationToken cancellationToken = default)
     {
         await using var connection = CreateConnection();
@@ -1109,4 +1131,88 @@ FROM integration_links WHERE integration_id = $integrationId ORDER BY created_at
         }
         return results;
     }
+
+    public async Task AppendRiskRegisterEntryAsync(RiskRegisterEntry entry, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+INSERT INTO risk_register_entries
+    (risk_id, run_id, title, category, severity, status, description, escalation_question,
+     derivation_rule, source_record_id, evidence_ids_json, provenance_id, supersedes_risk_id,
+     created_at_utc)
+VALUES
+    ($riskId, $runId, $title, $category, $severity, $status, $description, $escalationQuestion,
+     $derivationRule, $sourceRecordId, $evidenceIdsJson, $provenanceId, $supersedesRiskId,
+     $createdAtUtc);";
+        command.Parameters.AddWithValue("$riskId", entry.RiskId);
+        command.Parameters.AddWithValue("$runId", entry.RunId);
+        command.Parameters.AddWithValue("$title", entry.Title);
+        command.Parameters.AddWithValue("$category", entry.Category.ToString());
+        command.Parameters.AddWithValue("$severity", entry.Severity.ToString());
+        command.Parameters.AddWithValue("$status", entry.Status.ToString());
+        command.Parameters.AddWithValue("$description", entry.Description);
+        command.Parameters.AddWithValue("$escalationQuestion", entry.EscalationQuestion);
+        command.Parameters.AddWithValue("$derivationRule", entry.DerivationRule);
+        command.Parameters.AddWithValue("$sourceRecordId", entry.SourceRecordId);
+        command.Parameters.AddWithValue("$evidenceIdsJson", JsonSerializer.Serialize(entry.EvidenceIds, JsonOptions));
+        command.Parameters.AddWithValue("$provenanceId", entry.ProvenanceId);
+        command.Parameters.AddWithValue("$supersedesRiskId", (object?)entry.SupersedesRiskId ?? DBNull.Value);
+        command.Parameters.AddWithValue("$createdAtUtc", entry.CreatedAtUtc.ToString("O"));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<RiskRegisterEntry>> GetRiskRegisterEntriesAsync(string runId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+SELECT risk_id, run_id, title, category, severity, status, description, escalation_question,
+       derivation_rule, source_record_id, evidence_ids_json, provenance_id, supersedes_risk_id,
+       created_at_utc
+FROM risk_register_entries WHERE run_id = $runId ORDER BY created_at_utc;";
+        command.Parameters.AddWithValue("$runId", runId);
+        var results = new List<RiskRegisterEntry>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            results.Add(ReadRiskRegisterEntry(reader));
+        }
+        return results;
+    }
+
+    public async Task<RiskRegisterEntry?> GetRiskRegisterEntryAsync(string riskId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+SELECT risk_id, run_id, title, category, severity, status, description, escalation_question,
+       derivation_rule, source_record_id, evidence_ids_json, provenance_id, supersedes_risk_id,
+       created_at_utc
+FROM risk_register_entries WHERE risk_id = $riskId;";
+        command.Parameters.AddWithValue("$riskId", riskId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadRiskRegisterEntry(reader) : null;
+    }
+
+    private static RiskRegisterEntry ReadRiskRegisterEntry(SqliteDataReader reader) => new()
+    {
+        RiskId = reader.GetString(0),
+        RunId = reader.GetString(1),
+        Title = reader.GetString(2),
+        Category = Enum.Parse<RiskCategory>(reader.GetString(3)),
+        Severity = Enum.Parse<RiskSeverity>(reader.GetString(4)),
+        Status = Enum.Parse<RiskStatus>(reader.GetString(5)),
+        Description = reader.GetString(6),
+        EscalationQuestion = reader.GetString(7),
+        DerivationRule = reader.GetString(8),
+        SourceRecordId = reader.GetString(9),
+        EvidenceIds = JsonSerializer.Deserialize<List<string>>(reader.GetString(10), JsonOptions) ?? new List<string>(),
+        ProvenanceId = reader.GetString(11),
+        SupersedesRiskId = reader.IsDBNull(12) ? null : reader.GetString(12),
+        CreatedAtUtc = DateTimeOffset.Parse(reader.GetString(13)),
+    };
 }

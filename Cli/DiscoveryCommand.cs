@@ -31,6 +31,8 @@ public static class DiscoveryCommand
         root.AddCommand(BuildClassifyIntegrationsCommand(loggerFactory));
         root.AddCommand(BuildExportCommand(loggerFactory));
         root.AddCommand(BuildExportIntegrationsCommand(loggerFactory));
+        root.AddCommand(BuildRiskRegisterCommand(loggerFactory));
+        root.AddCommand(BuildExportHandoffCommand(loggerFactory));
 
         return root;
     }
@@ -648,4 +650,77 @@ public static class DiscoveryCommand
         string.IsNullOrWhiteSpace(value)
             ? Array.Empty<string>()
             : value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    private static Command BuildRiskRegisterCommand(ILoggerFactory loggerFactory)
+    {
+        var cmd = new Command("build-risk-register",
+            "Deterministically derive the risk register (design doc §6 section 9, issue #5) from " +
+            "already-persisted context candidates, integrations, role assignments, and documented " +
+            "analyzer limitations for a run. Idempotent: re-running skips entries already recorded " +
+            "for the same (derivation rule, source record) pair.");
+
+        var runIdOption = new Option<string>("--run-id", "Run to derive the risk register for.") { IsRequired = true };
+        cmd.AddOption(runIdOption);
+
+        var databaseOption = new Option<string>("--database", () => DefaultDatabasePath, "Path to the Discovery Factory SQLite database.");
+        cmd.AddOption(databaseOption);
+
+        cmd.SetHandler(async (string runId, string database) =>
+        {
+            var repository = CreateRepository(loggerFactory, database);
+            await repository.InitializeAsync();
+            var service = new DiscoveryService(repository, loggerFactory.CreateLogger<DiscoveryService>());
+
+            var appended = await service.BuildRiskRegisterAsync(runId, producerVersion: "RiskRegisterBuilder/1.0");
+            Console.Out.WriteLine($"Appended {appended.Count} new risk register entries for {runId}.");
+            if (appended.Count > 0)
+            {
+                foreach (var group in appended.GroupBy(r => r.Severity).OrderByDescending(g => g.Key))
+                {
+                    Console.Out.WriteLine($"  {group.Key}: {group.Count()}");
+                }
+            }
+        }, runIdOption, databaseOption);
+
+        return cmd;
+    }
+
+    private static Command BuildExportHandoffCommand(ILoggerFactory loggerFactory)
+    {
+        var cmd = new Command("export-handoff",
+            "Export the full 10-section Specification Factory handoff (design doc §6, issue #5) " +
+            "for a run to versioned Markdown and JSON. Run 'build-risk-register' first so section 9 " +
+            "reflects the current risk register.");
+
+        var runIdOption = new Option<string>("--run-id", "Run to export the handoff for.") { IsRequired = true };
+        cmd.AddOption(runIdOption);
+
+        var outputDirOption = new Option<string>("--output-dir", () => "output/discovery", "Directory to write the handoff Markdown/JSON pair to.");
+        cmd.AddOption(outputDirOption);
+
+        var databaseOption = new Option<string>("--database", () => DefaultDatabasePath, "Path to the Discovery Factory SQLite database.");
+        cmd.AddOption(databaseOption);
+
+        cmd.SetHandler(async (string runId, string outputDir, string database) =>
+        {
+            var repository = CreateRepository(loggerFactory, database);
+            await repository.InitializeAsync();
+            var exporter = new DiscoveryExporter(repository);
+
+            try
+            {
+                var (markdownPath, jsonPath) = await exporter.ExportHandoffAsync(runId, outputDir);
+                Console.Out.WriteLine($"Exported Specification Factory handoff for {runId} to:");
+                Console.Out.WriteLine($"  {markdownPath}");
+                Console.Out.WriteLine($"  {jsonPath}");
+            }
+            catch (InvalidOperationException ex)
+            {
+                Console.Error.WriteLine(ex.Message);
+                Environment.ExitCode = 2;
+            }
+        }, runIdOption, outputDirOption, databaseOption);
+
+        return cmd;
+    }
 }

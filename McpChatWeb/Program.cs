@@ -6628,6 +6628,45 @@ app.MapGet("/api/discovery/runs/{runId}/integrations", async (string runId, Cobo
 	return Results.Ok(new { integrations = items, countsByClassification = byClassification });
 });
 
+app.MapGet("/api/discovery/runs/{runId}/risks", async (string runId, CobolToQuarkusMigration.Discovery.DiscoveryService svc) =>
+{
+	var risks = await svc.GetRiskRegisterEntriesAsync(runId);
+
+	var items = risks
+		.Where(r => r.Status != CobolToQuarkusMigration.Discovery.Models.RiskStatus.Superseded)
+		.OrderByDescending(r => r.Severity)
+		.Select(r => new
+		{
+			r.RiskId,
+			r.Title,
+			Category = r.Category.ToString(),
+			Severity = r.Severity.ToString(),
+			Status = r.Status.ToString(),
+			r.Description,
+			r.EscalationQuestion,
+			r.DerivationRule,
+			r.SourceRecordId,
+			r.EvidenceIds,
+			r.CreatedAtUtc
+		});
+
+	return Results.Ok(new { risks = items });
+});
+
+app.MapGet("/api/discovery/runs/{runId}/handoff", async (string runId, CobolToQuarkusMigration.Discovery.Persistence.IDiscoveryRepository repo) =>
+{
+	try
+	{
+		var assembler = new CobolToQuarkusMigration.Discovery.Export.DiscoveryHandoffAssembler(repo);
+		var handoff = await assembler.AssembleAsync(runId);
+		return Results.Ok(handoff);
+	}
+	catch (InvalidOperationException ex)
+	{
+		return Results.NotFound(new { error = ex.Message });
+	}
+});
+
 app.Run();
 
 /// <summary>Request body for Discovery review-queue decision endpoints.</summary>

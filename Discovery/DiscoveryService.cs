@@ -815,6 +815,79 @@ public sealed class DiscoveryService
     public Task<IReadOnlyList<IntegrationLink>> GetIntegrationLinksAsync(string integrationId, CancellationToken cancellationToken = default)
         => _repository.GetIntegrationLinksAsync(integrationId, cancellationToken);
 
+    // ---------------------------------------------------------------------------------------
+    // Discovery Factory phase 7 (issue #5): risk register, derived purely from already-persisted
+    // records for the run via Discovery.Risks.RiskRegisterBuilder. Never re-derives context,
+    // integration, or role facts — only reads them.
+    // ---------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Derives and persists the risk register for a run (design doc §6 section 9, issue #5).
+    /// Idempotent: re-running for the same run set skips any (DerivationRule, SourceRecordId) pair
+    /// that already has a non-superseded open entry, so repeated calls never create duplicates.
+    /// </summary>
+    public async Task<IReadOnlyList<RiskRegisterEntry>> BuildRiskRegisterAsync(
+        string runId,
+        string producerVersion,
+        CancellationToken cancellationToken = default)
+    {
+        var contexts = await _repository.GetContextCandidatesAsync(runId, cancellationToken);
+        var integrations = await _repository.GetIntegrationsAsync(runId, cancellationToken);
+        var roles = await _repository.GetRoleAssignmentsAsync(runId, cancellationToken);
+        var findings = await _repository.GetFindingsAsync(runId, cancellationToken);
+        var existing = await _repository.GetRiskRegisterEntriesAsync(runId, cancellationToken);
+        var existingKeys = existing
+            .Where(e => e.Status != RiskStatus.Superseded)
+            .Select(e => (e.DerivationRule, e.SourceRecordId))
+            .ToHashSet();
+
+        var candidates = Risks.RiskRegisterBuilder.Build(contexts, integrations, roles, findings, runId);
+
+        var results = new List<RiskRegisterEntry>();
+        foreach (var candidate in candidates)
+        {
+            if (existingKeys.Contains((candidate.DerivationRule, candidate.SourceRecordId)))
+            {
+                continue;
+            }
+
+            var provenance = new Provenance
+            {
+                ProvenanceId = NewId("PROV"),
+                RunId = runId,
+                ProducerKind = "DeterministicExtractor",
+                ProducerVersion = producerVersion,
+                InputRecordIds = candidate.EvidenceIds,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+            };
+            await _repository.AppendProvenanceAsync(provenance, cancellationToken);
+
+            var entry = new RiskRegisterEntry
+            {
+                RiskId = NewId("R"),
+                RunId = runId,
+                Title = candidate.Title,
+                Category = candidate.Category,
+                Severity = candidate.Severity,
+                Status = RiskStatus.Open,
+                Description = candidate.Description,
+                EscalationQuestion = candidate.EscalationQuestion,
+                DerivationRule = candidate.DerivationRule,
+                SourceRecordId = candidate.SourceRecordId,
+                EvidenceIds = candidate.EvidenceIds,
+                ProvenanceId = provenance.ProvenanceId,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+            };
+            await _repository.AppendRiskRegisterEntryAsync(entry, cancellationToken);
+            results.Add(entry);
+        }
+
+        return results;
+    }
+
+    public Task<IReadOnlyList<RiskRegisterEntry>> GetRiskRegisterEntriesAsync(string runId, CancellationToken cancellationToken = default)
+        => _repository.GetRiskRegisterEntriesAsync(runId, cancellationToken);
+
     private async Task AppendStatusOnlyRevisionAsync(
         FindingRevision current,
         ReviewStatus newStatus,

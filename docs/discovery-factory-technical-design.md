@@ -863,3 +863,71 @@ not change the deferred decisions in §12.
     `RoleAssignment`, or `ContextCandidate`) so a later graph projection can consume it
     without requiring any schema change now; this phase does not implement or require
     Neo4j.
+
+- **Phase 7 (issue #5): risk register and Specification Factory handoff.**
+  - **`RiskRegisterEntry` is its own model, not folded into `Finding`.** A risk is a
+    derived, append-only observation about a gap, conflict, unconfirmed record, or
+    documented analyzer limitation — it does not carry independent evidence the way a
+    `Finding` does; it *cites* existing evidence/finding/context/integration IDs. Keeping
+    it as a separate table (`0005_risk_register.sql`, migration 5) avoids overloading
+    `Finding`'s established review-lifecycle semantics (`Candidate` →
+    `HumanReview`/`Published`/`Rejected`/`NeedsEvidence`) with a different kind of
+    lifecycle (`Open`/`Acknowledged`/`Resolved`/`Superseded`) that a risk actually needs.
+  - **Stable `R-` identifiers with append-only supersession**, mirroring the existing
+    `FindingRevision.SupersedesRevisionId` pattern: `RiskRegisterBuilder` re-derives the
+    full candidate risk set from current gaps/conflicts/unconfirmed records each run,
+    diffs against previously-persisted, non-superseded risks by a natural key (derivation
+    rule + source record ID), and only appends genuinely new risks; a changed underlying
+    condition (e.g. a context that later gets published) is expressed as a brand-new row
+    with `SupersedesRiskId` pointing at the prior row — the prior row's `RiskId` primary
+    key is never mutated or reused. This makes `BuildRiskRegisterAsync` idempotent: a
+    second call against unchanged inputs appends zero new rows.
+  - **Risk categories derived purely from existing Phase 1-6 records, not new analysis:**
+    `UnconfirmedFinding` (one risk per `ContextCandidate`/integration/role assignment at
+    `NeedsEvidence`/`RequiresReview`), `EvidenceGap` (the sections-3/4 gap below), and
+    `AnalyzerLimitation` (fixed entries transcribing the already-documented §14 limits:
+    syntax-tree-only analysis with no `CSharpCompilation`/`SemanticModel`, the `Shared`
+    generic-namespace fan-in heuristic being a textual proxy rather than verified symbol
+    binding, and — newly generalized — any candidate context whose cluster name matches a
+    known generic/cross-cutting segment, e.g. `Planbordv2.Utilities`, `Shared`).
+  - **Sections 3/4 (use cases; business rules) resolve the open question by explicit,
+    linked honesty rather than fabrication.** No extractor for use-case/functional-flow or
+    business-rule/policy/state-transition content exists in Phases 1-6, and this phase does
+    not build one (out of scope per the issue). `DiscoveryHandoffAssembler` always emits a
+    single fixed `EvidenceGap` risk (`UseCaseBusinessRuleExtractionGap`) the first time a
+    run's risk register is built, and renders sections 3 and 4 with `isSparse = true`, a
+    literal gap explanation, and a `linkedRiskId` pointing at that risk — never inventing
+    use-case or business-rule content from unrelated `Finding` records.
+  - **No-future-state-language guard.** `DiscoveryExporter` scans the fully rendered
+    Markdown for a fixed deny-list of roadmap/backlog/modernization phrases
+    (`recommend`, `should migrate`, `roadmap`, `backlog`, `modernize`/`modernization`,
+    `future state`, `next steps`, etc.) before writing either export file, and throws
+    rather than emitting a handoff that violates the issue's "no future-state
+    prescription" constraint. This is a guard against regression, not a substitute for
+    keeping all section templates in current-state, descriptive language.
+  - **Export contract version bumped to `1.1.0`, additive only.** The existing `1.0.0`
+    integration-export contract (`export-integrations`) is unchanged; `1.1.0` adds the
+    ten-section handoff shape (`export-handoff`) alongside it. No existing field, file, or
+    CLI command from Phases 1-6 was renamed or removed.
+  - **Real PlanBoard pilot run** (`RUN-0512CB37`, full pipeline: `classify-roles` →
+    `build-graph` → `seed-contexts` → `classify-integrations` → `build-risk-register` →
+    `export-handoff`) reproduced the Phase 5/6 baseline exactly (553 graph nodes / 1,601
+    edges, 28 candidate contexts including `ForecastApprovals` at confidence 0.70, 114
+    integrations with the same classification/category breakdown as `RUN-ED2EB345`) and
+    then derived **264 risk register entries**: 1 `High`, 35 `Medium`, 228 `Low`; by
+    category, 260 `UnconfirmedFinding` (one per `NeedsEvidence` context candidate and
+    `RequiresReview` integration/role), 3 `AnalyzerLimitation` (syntax-tree-only analysis,
+    the `Shared` generic-namespace heuristic, and the newly-flagged
+    `Planbordv2.Utilities` generic/cross-cutting cluster), and 1 `EvidenceGap`
+    (`R-6F01226B`, the sections-3/4 use-case/business-rule extraction gap). The exported
+    handoff (`RUN-0512CB37-handoff.md`, `RUN-0512CB37-handoff.json`) contains all ten
+    sections: sections 3 and 4 both render `isSparse = true` with the literal gap
+    statement "No use-case/functional-flow extractor has run for this subject in Phases
+    1-6; this section has no supporting records" (respectively for business rules) and
+    `linkedRiskId = "R-6F01226B"`; section 9 lists all 264 non-superseded risks with
+    citations and escalation questions; section 10 reports 745 artifacts, 2,747 evidence
+    records, 28 context candidates, 114 integrations, and 264 risks, plus a
+    navigation-only description of the future §8 MCP query operations (no endpoints
+    implemented). The export passed the no-future-state-language guard with zero
+    violations, and every risk ID cited in the JSON export is also cited in the rendered
+    Markdown (parity confirmed by `DiscoveryHandoffTests`).

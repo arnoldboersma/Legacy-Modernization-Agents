@@ -27,6 +27,7 @@ public interface IDiscoveryRepository
 
     Task AppendFindingAsync(Finding finding, CancellationToken cancellationToken = default);
     Task<Finding?> GetFindingAsync(string findingId, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<Finding>> GetFindingsAsync(string runId, CancellationToken cancellationToken = default);
 
     Task AppendFindingRevisionAsync(FindingRevision revision, CancellationToken cancellationToken = default);
     Task<FindingRevision?> GetFindingRevisionAsync(string findingRevisionId, CancellationToken cancellationToken = default);
@@ -72,4 +73,8 @@ public interface IDiscoveryRepository
 
     Task AppendIntegrationLinkAsync(IntegrationLink link, CancellationToken cancellationToken = default);
     Task<IReadOnlyList<IntegrationLink>> GetIntegrationLinksAsync(string integrationId, CancellationToken cancellationToken = default);
+
+    Task AppendRiskRegisterEntryAsync(RiskRegisterEntry entry, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<RiskRegisterEntry>> GetRiskRegisterEntriesAsync(string runId, CancellationToken cancellationToken = default);
+    Task<RiskRegisterEntry?> GetRiskRegisterEntryAsync(string riskId, CancellationToken cancellationToken = default);
 }
