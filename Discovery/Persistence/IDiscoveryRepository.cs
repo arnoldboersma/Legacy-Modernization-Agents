@@ -48,4 +48,21 @@ public interface IDiscoveryRepository
     Task AppendRoleAssignmentAsync(RoleAssignment assignment, CancellationToken cancellationToken = default);
     Task<IReadOnlyList<RoleAssignment>> GetRoleAssignmentsAsync(string runId, CancellationToken cancellationToken = default);
     Task<IReadOnlyList<RoleAssignment>> GetRoleAssignmentsForArtifactAsync(string artifactId, CancellationToken cancellationToken = default);
+
+    Task AppendGraphNodeAsync(DependencyGraphNode node, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<DependencyGraphNode>> GetGraphNodesAsync(string runId, CancellationToken cancellationToken = default);
+
+    Task AppendGraphEdgeAsync(DependencyGraphEdge edge, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<DependencyGraphEdge>> GetGraphEdgesAsync(string runId, CancellationToken cancellationToken = default);
+
+    Task AppendContextCandidateAsync(ContextCandidate candidate, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<ContextCandidate>> GetContextCandidatesAsync(string runId, CancellationToken cancellationToken = default);
+    Task<ContextCandidate?> GetContextCandidateAsync(string contextCandidateId, CancellationToken cancellationToken = default);
+
+    Task AppendContextMembershipAsync(ContextMembership membership, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<ContextMembership>> GetContextMembershipsAsync(string runId, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<ContextMembership>> GetContextMembershipsForContextAsync(string contextCandidateId, CancellationToken cancellationToken = default);
+
+    Task AppendContextDependencyEdgeAsync(ContextDependencyEdge edge, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<ContextDependencyEdge>> GetContextDependencyEdgesAsync(string runId, CancellationToken cancellationToken = default);
 }

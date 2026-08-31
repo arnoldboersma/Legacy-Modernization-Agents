@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using CobolToQuarkusMigration.Discovery;
 using CobolToQuarkusMigration.Discovery.Export;
+using CobolToQuarkusMigration.Discovery.Graph;
 using CobolToQuarkusMigration.Discovery.Models;
 using CobolToQuarkusMigration.Discovery.Persistence;
 using CobolToQuarkusMigration.Discovery.Roles;
@@ -25,6 +26,8 @@ public static class DiscoveryCommand
         root.AddCommand(BuildStartRunCommand(loggerFactory));
         root.AddCommand(BuildSeedDemoCommand(loggerFactory));
         root.AddCommand(BuildClassifyRolesCommand(loggerFactory));
+        root.AddCommand(BuildGraphCommand(loggerFactory));
+        root.AddCommand(BuildSeedContextsCommand(loggerFactory));
         root.AddCommand(BuildExportCommand(loggerFactory));
 
         return root;
@@ -262,6 +265,176 @@ public static class DiscoveryCommand
                 Console.Out.WriteLine($"  {group.Key}: {group.Count()}{(group.Any(a => a.RequiresReview) ? " (some require review)" : string.Empty)}");
             }
         }, runIdOption, sourceDirOption, databaseOption);
+
+        return cmd;
+    }
+
+    private static Command BuildGraphCommand(ILoggerFactory loggerFactory)
+    {
+        var cmd = new Command("build-graph",
+            "Deterministically build a typed dependency graph (projects, namespaces, types, routes, " +
+            "DbContext/entity mappings, DI registrations, cross-type references) from C# source under " +
+            "--source-dir, appending graph nodes/edges and evidence to a run (design doc §5.1, issue #3).");
+
+        var runIdOption = new Option<string?>("--run-id", "Existing run to append to. If omitted, a new run is declared automatically.");
+        cmd.AddOption(runIdOption);
+
+        var sourceDirOption = new Option<string>("--source-dir", "Directory containing the C# solution/project source to graph (e.g. a PlanBoard checkout). Scanned recursively; bin/obj are always excluded.") { IsRequired = true };
+        cmd.AddOption(sourceDirOption);
+
+        var focusNamespacePrefixOption = new Option<string?>("--focus-namespace-prefix",
+            "Optional namespace prefix (e.g. \"Planbordv2.Api.Forecast\") to additionally report a focused " +
+            "node/edge count for, without limiting what is persisted. Supports a detailed pilot focus area " +
+            "(e.g. Forecast Management) on top of the whole-solution pass.");
+        cmd.AddOption(focusNamespacePrefixOption);
+
+        var databaseOption = new Option<string>("--database", () => DefaultDatabasePath, "Path to the Discovery Factory SQLite database.");
+        cmd.AddOption(databaseOption);
+
+        cmd.SetHandler(async (string? runId, string sourceDir, string? focusNamespacePrefix, string database) =>
+        {
+            var repository = CreateRepository(loggerFactory, database);
+            var service = new DiscoveryService(repository, loggerFactory.CreateLogger<DiscoveryService>());
+
+            if (!Directory.Exists(sourceDir))
+            {
+                Console.Error.WriteLine($"Source directory not found: {sourceDir}");
+                Environment.ExitCode = 2;
+                return;
+            }
+
+            DiscoveryRun run;
+            if (!string.IsNullOrWhiteSpace(runId))
+            {
+                await repository.InitializeAsync();
+                run = await repository.GetRunAsync(runId)
+                    ?? throw new InvalidOperationException($"Run not found: {runId}");
+            }
+            else
+            {
+                run = await service.StartRunAsync(
+                    subject: "PlanBoard dependency graph (issue #3)",
+                    sourceLocator: Path.GetFullPath(sourceDir),
+                    sourceRevision: "local-working-tree",
+                    inclusions: new[] { sourceDir },
+                    exclusions: new[] { "bin/", "obj/" },
+                    evidenceBoundary: "Static C# source only (Roslyn syntax-tree parsing, no semantic binding); no configuration, schema, or runtime logs.");
+            }
+
+            var csprojFiles = Directory.EnumerateFiles(sourceDir, "*.csproj", SearchOption.AllDirectories)
+                .Where(f => !ArtifactRoleClassifier.IsExcludedBuildOutputPath(Path.GetRelativePath(sourceDir, f)))
+                .ToList();
+
+            var csFiles = Directory.EnumerateFiles(sourceDir, "*.cs", SearchOption.AllDirectories)
+                .Where(f => !ArtifactRoleClassifier.IsExcludedBuildOutputPath(Path.GetRelativePath(sourceDir, f)))
+                .ToList();
+
+            if (csprojFiles.Count == 0 && csFiles.Count == 0)
+            {
+                Console.Error.WriteLine($"No .csproj or .cs files found under {sourceDir}");
+                Environment.ExitCode = 2;
+                return;
+            }
+
+            async Task<ClassifierSourceFile> ToClassifierFileAsync(string path)
+            {
+                var content = await File.ReadAllTextAsync(path);
+                var relativePath = Path.GetRelativePath(sourceDir, path);
+                return new ClassifierSourceFile(relativePath, content);
+            }
+
+            var csprojClassifierFiles = new List<ClassifierSourceFile>();
+            foreach (var f in csprojFiles) csprojClassifierFiles.Add(await ToClassifierFileAsync(f));
+
+            var csClassifierFiles = new List<ClassifierSourceFile>();
+            foreach (var f in csFiles) csClassifierFiles.Add(await ToClassifierFileAsync(f));
+
+            var artifactIdByRelativePath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (relativePath, content) in csprojClassifierFiles.Select(f => (f.Path, f.Text))
+                         .Concat(csClassifierFiles.Select(f => (f.Path, f.Text))))
+            {
+                var contentHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(content))).ToLowerInvariant();
+                var artifact = await service.AppendArtifactAsync(run.RunId, relativePath, "CSharp", contentHash, content.Length);
+                artifactIdByRelativePath[relativePath] = artifact.ArtifactId;
+            }
+
+            var projectGraph = DependencyGraphBuilder.BuildProjectGraph(csprojClassifierFiles);
+            var sourceGraph = DependencyGraphBuilder.BuildSourceGraph(csClassifierFiles);
+
+            var allNodeCandidates = projectGraph.Nodes.Concat(sourceGraph.Nodes)
+                .Select(n => (Candidate: n, ArtifactId: n.ArtifactPath is not null && artifactIdByRelativePath.TryGetValue(n.ArtifactPath, out var id) ? id : (string?)null))
+                .ToList();
+            var allEdgeCandidates = projectGraph.Edges.Concat(sourceGraph.Edges).ToList();
+
+            var (nodes, edges) = await service.AppendDependencyGraphAsync(
+                run.RunId, allNodeCandidates, allEdgeCandidates, producerVersion: "DependencyGraphBuilder/1.0");
+
+            Console.Out.WriteLine($"Run: {run.RunId}");
+            Console.Out.WriteLine($"Graph nodes appended: {nodes.Count} (of {allNodeCandidates.Count} candidate(s) seen).");
+            foreach (var group in nodes.GroupBy(n => n.Kind).OrderBy(g => g.Key))
+            {
+                Console.Out.WriteLine($"  {group.Key}: {group.Count()}");
+            }
+            Console.Out.WriteLine($"Graph edges appended: {edges.Count} (of {allEdgeCandidates.Count} candidate(s) seen).");
+            foreach (var group in edges.GroupBy(e => e.Kind).OrderBy(g => g.Key))
+            {
+                Console.Out.WriteLine($"  {group.Key}: {group.Count()}");
+            }
+
+            if (!string.IsNullOrWhiteSpace(focusNamespacePrefix))
+            {
+                var focusNodes = nodes.Where(n => n.SymbolLocator.StartsWith(focusNamespacePrefix, StringComparison.Ordinal)).ToList();
+                Console.Out.WriteLine($"Focus '{focusNamespacePrefix}': {focusNodes.Count} node(s).");
+            }
+        }, runIdOption, sourceDirOption, focusNamespacePrefixOption, databaseOption);
+
+        return cmd;
+    }
+
+    private static Command BuildSeedContextsCommand(ILoggerFactory loggerFactory)
+    {
+        var cmd = new Command("seed-contexts",
+            "Deterministically seed candidate logical contexts / module boundaries from a run's dependency " +
+            "graph and role assignments (design doc §5.1, issue #3). Candidates remain Plausible/Unconfirmed " +
+            "until a human reviewer confirms them; this command never publishes a context claim.");
+
+        var runIdOption = new Option<string>("--run-id", "Run whose dependency graph and role assignments to seed contexts from.") { IsRequired = true };
+        cmd.AddOption(runIdOption);
+
+        var databaseOption = new Option<string>("--database", () => DefaultDatabasePath, "Path to the Discovery Factory SQLite database.");
+        cmd.AddOption(databaseOption);
+
+        cmd.SetHandler(async (string runId, string database) =>
+        {
+            var repository = CreateRepository(loggerFactory, database);
+            await repository.InitializeAsync();
+            var run = await repository.GetRunAsync(runId)
+                ?? throw new InvalidOperationException($"Run not found: {runId}");
+            var service = new DiscoveryService(repository, loggerFactory.CreateLogger<DiscoveryService>());
+
+            var candidates = await service.SeedContextCandidatesAsync(run.RunId, producerVersion: "ContextSeeder/1.0");
+
+            Console.Out.WriteLine($"Run: {run.RunId}");
+            Console.Out.WriteLine($"Seeded {candidates.Count} candidate context(s).");
+            foreach (var candidate in candidates.OrderByDescending(c => c.Confidence))
+            {
+                Console.Out.WriteLine($"  [{candidate.Status}] {candidate.Kind} '{candidate.Name}' " +
+                    $"(confidence={candidate.Confidence:F2}, rule={candidate.SeedingRule}, id={candidate.ContextCandidateId})");
+            }
+
+            var dependencyEdges = await service.GetContextDependencyEdgesAsync(run.RunId);
+            if (dependencyEdges.Count > 0)
+            {
+                var byId = candidates.ToDictionary(c => c.ContextCandidateId, c => c.Name);
+                Console.Out.WriteLine($"Cross-context dependencies: {dependencyEdges.Count}");
+                foreach (var edge in dependencyEdges)
+                {
+                    var from = byId.GetValueOrDefault(edge.FromContextCandidateId, edge.FromContextCandidateId);
+                    var to = byId.GetValueOrDefault(edge.ToContextCandidateId, edge.ToContextCandidateId);
+                    Console.Out.WriteLine($"  {from} -> {to} (confidence={edge.Confidence:F2})");
+                }
+            }
+        }, runIdOption, databaseOption);
 
         return cmd;
     }

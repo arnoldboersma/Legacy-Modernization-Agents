@@ -657,4 +657,303 @@ FROM role_assignments WHERE artifact_id = $artifactId ORDER BY created_at_utc;";
         ProvenanceId = reader.GetString(9),
         CreatedAtUtc = DateTimeOffset.Parse(reader.GetString(10)),
     };
+
+    // ---------------------------------------------------------------------------------------
+    // Discovery Factory phase 5 (issue #3): dependency graph and candidate context persistence.
+    // ---------------------------------------------------------------------------------------
+
+    public async Task AppendGraphNodeAsync(DependencyGraphNode node, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+INSERT INTO graph_nodes
+    (node_id, run_id, kind, symbol_locator, display_name, artifact_id, evidence_ids_json, created_at_utc)
+VALUES
+    ($nodeId, $runId, $kind, $symbolLocator, $displayName, $artifactId, $evidenceIdsJson, $createdAtUtc);";
+        command.Parameters.AddWithValue("$nodeId", node.NodeId);
+        command.Parameters.AddWithValue("$runId", node.RunId);
+        command.Parameters.AddWithValue("$kind", node.Kind.ToString());
+        command.Parameters.AddWithValue("$symbolLocator", node.SymbolLocator);
+        command.Parameters.AddWithValue("$displayName", node.DisplayName);
+        command.Parameters.AddWithValue("$artifactId", (object?)node.ArtifactId ?? DBNull.Value);
+        command.Parameters.AddWithValue("$evidenceIdsJson", JsonSerializer.Serialize(node.EvidenceIds, JsonOptions));
+        command.Parameters.AddWithValue("$createdAtUtc", node.CreatedAtUtc.ToString("O"));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<DependencyGraphNode>> GetGraphNodesAsync(string runId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+SELECT node_id, run_id, kind, symbol_locator, display_name, artifact_id, evidence_ids_json, created_at_utc
+FROM graph_nodes WHERE run_id = $runId ORDER BY created_at_utc;";
+        command.Parameters.AddWithValue("$runId", runId);
+        var results = new List<DependencyGraphNode>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            results.Add(ReadGraphNode(reader));
+        }
+        return results;
+    }
+
+    private static DependencyGraphNode ReadGraphNode(SqliteDataReader reader) => new()
+    {
+        NodeId = reader.GetString(0),
+        RunId = reader.GetString(1),
+        Kind = Enum.Parse<GraphNodeKind>(reader.GetString(2)),
+        SymbolLocator = reader.GetString(3),
+        DisplayName = reader.GetString(4),
+        ArtifactId = reader.IsDBNull(5) ? null : reader.GetString(5),
+        EvidenceIds = JsonSerializer.Deserialize<List<string>>(reader.GetString(6), JsonOptions) ?? new List<string>(),
+        CreatedAtUtc = DateTimeOffset.Parse(reader.GetString(7)),
+    };
+
+    public async Task AppendGraphEdgeAsync(DependencyGraphEdge edge, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+INSERT INTO graph_edges
+    (edge_id, run_id, from_node_id, to_node_id, kind, evidence_ids_json, confidence, created_at_utc)
+VALUES
+    ($edgeId, $runId, $fromNodeId, $toNodeId, $kind, $evidenceIdsJson, $confidence, $createdAtUtc);";
+        command.Parameters.AddWithValue("$edgeId", edge.EdgeId);
+        command.Parameters.AddWithValue("$runId", edge.RunId);
+        command.Parameters.AddWithValue("$fromNodeId", edge.FromNodeId);
+        command.Parameters.AddWithValue("$toNodeId", edge.ToNodeId);
+        command.Parameters.AddWithValue("$kind", edge.Kind.ToString());
+        command.Parameters.AddWithValue("$evidenceIdsJson", JsonSerializer.Serialize(edge.EvidenceIds, JsonOptions));
+        command.Parameters.AddWithValue("$confidence", edge.Confidence);
+        command.Parameters.AddWithValue("$createdAtUtc", edge.CreatedAtUtc.ToString("O"));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<DependencyGraphEdge>> GetGraphEdgesAsync(string runId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+SELECT edge_id, run_id, from_node_id, to_node_id, kind, evidence_ids_json, confidence, created_at_utc
+FROM graph_edges WHERE run_id = $runId ORDER BY created_at_utc;";
+        command.Parameters.AddWithValue("$runId", runId);
+        var results = new List<DependencyGraphEdge>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            results.Add(ReadGraphEdge(reader));
+        }
+        return results;
+    }
+
+    private static DependencyGraphEdge ReadGraphEdge(SqliteDataReader reader) => new()
+    {
+        EdgeId = reader.GetString(0),
+        RunId = reader.GetString(1),
+        FromNodeId = reader.GetString(2),
+        ToNodeId = reader.GetString(3),
+        Kind = Enum.Parse<GraphEdgeKind>(reader.GetString(4)),
+        EvidenceIds = JsonSerializer.Deserialize<List<string>>(reader.GetString(5), JsonOptions) ?? new List<string>(),
+        Confidence = reader.GetDouble(6),
+        CreatedAtUtc = DateTimeOffset.Parse(reader.GetString(7)),
+    };
+
+    public async Task AppendContextCandidateAsync(ContextCandidate candidate, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+INSERT INTO context_candidates
+    (context_candidate_id, run_id, name, kind, status, confidence, evidence_ids_json,
+     seeding_rule, provenance_id, supersedes_context_candidate_id, created_at_utc)
+VALUES
+    ($contextCandidateId, $runId, $name, $kind, $status, $confidence, $evidenceIdsJson,
+     $seedingRule, $provenanceId, $supersedesContextCandidateId, $createdAtUtc);";
+        command.Parameters.AddWithValue("$contextCandidateId", candidate.ContextCandidateId);
+        command.Parameters.AddWithValue("$runId", candidate.RunId);
+        command.Parameters.AddWithValue("$name", candidate.Name);
+        command.Parameters.AddWithValue("$kind", candidate.Kind.ToString());
+        command.Parameters.AddWithValue("$status", candidate.Status.ToString());
+        command.Parameters.AddWithValue("$confidence", candidate.Confidence);
+        command.Parameters.AddWithValue("$evidenceIdsJson", JsonSerializer.Serialize(candidate.EvidenceIds, JsonOptions));
+        command.Parameters.AddWithValue("$seedingRule", candidate.SeedingRule);
+        command.Parameters.AddWithValue("$provenanceId", candidate.ProvenanceId);
+        command.Parameters.AddWithValue("$supersedesContextCandidateId", (object?)candidate.SupersedesContextCandidateId ?? DBNull.Value);
+        command.Parameters.AddWithValue("$createdAtUtc", candidate.CreatedAtUtc.ToString("O"));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<ContextCandidate>> GetContextCandidatesAsync(string runId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+SELECT context_candidate_id, run_id, name, kind, status, confidence, evidence_ids_json,
+       seeding_rule, provenance_id, supersedes_context_candidate_id, created_at_utc
+FROM context_candidates WHERE run_id = $runId ORDER BY created_at_utc;";
+        command.Parameters.AddWithValue("$runId", runId);
+        var results = new List<ContextCandidate>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            results.Add(ReadContextCandidate(reader));
+        }
+        return results;
+    }
+
+    public async Task<ContextCandidate?> GetContextCandidateAsync(string contextCandidateId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+SELECT context_candidate_id, run_id, name, kind, status, confidence, evidence_ids_json,
+       seeding_rule, provenance_id, supersedes_context_candidate_id, created_at_utc
+FROM context_candidates WHERE context_candidate_id = $contextCandidateId;";
+        command.Parameters.AddWithValue("$contextCandidateId", contextCandidateId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadContextCandidate(reader) : null;
+    }
+
+    private static ContextCandidate ReadContextCandidate(SqliteDataReader reader) => new()
+    {
+        ContextCandidateId = reader.GetString(0),
+        RunId = reader.GetString(1),
+        Name = reader.GetString(2),
+        Kind = Enum.Parse<ContextCandidateKind>(reader.GetString(3)),
+        Status = Enum.Parse<ReviewStatus>(reader.GetString(4)),
+        Confidence = reader.GetDouble(5),
+        EvidenceIds = JsonSerializer.Deserialize<List<string>>(reader.GetString(6), JsonOptions) ?? new List<string>(),
+        SeedingRule = reader.GetString(7),
+        ProvenanceId = reader.GetString(8),
+        SupersedesContextCandidateId = reader.IsDBNull(9) ? null : reader.GetString(9),
+        CreatedAtUtc = DateTimeOffset.Parse(reader.GetString(10)),
+    };
+
+    public async Task AppendContextMembershipAsync(ContextMembership membership, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+INSERT INTO context_memberships
+    (context_membership_id, run_id, context_candidate_id, node_id, role, evidence_ids_json, created_at_utc)
+VALUES
+    ($contextMembershipId, $runId, $contextCandidateId, $nodeId, $role, $evidenceIdsJson, $createdAtUtc);";
+        command.Parameters.AddWithValue("$contextMembershipId", membership.ContextMembershipId);
+        command.Parameters.AddWithValue("$runId", membership.RunId);
+        command.Parameters.AddWithValue("$contextCandidateId", membership.ContextCandidateId);
+        command.Parameters.AddWithValue("$nodeId", membership.NodeId);
+        command.Parameters.AddWithValue("$role", membership.Role.ToString());
+        command.Parameters.AddWithValue("$evidenceIdsJson", JsonSerializer.Serialize(membership.EvidenceIds, JsonOptions));
+        command.Parameters.AddWithValue("$createdAtUtc", membership.CreatedAtUtc.ToString("O"));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<ContextMembership>> GetContextMembershipsAsync(string runId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+SELECT context_membership_id, run_id, context_candidate_id, node_id, role, evidence_ids_json, created_at_utc
+FROM context_memberships WHERE run_id = $runId ORDER BY created_at_utc;";
+        command.Parameters.AddWithValue("$runId", runId);
+        var results = new List<ContextMembership>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            results.Add(ReadContextMembership(reader));
+        }
+        return results;
+    }
+
+    public async Task<IReadOnlyList<ContextMembership>> GetContextMembershipsForContextAsync(string contextCandidateId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+SELECT context_membership_id, run_id, context_candidate_id, node_id, role, evidence_ids_json, created_at_utc
+FROM context_memberships WHERE context_candidate_id = $contextCandidateId ORDER BY created_at_utc;";
+        command.Parameters.AddWithValue("$contextCandidateId", contextCandidateId);
+        var results = new List<ContextMembership>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            results.Add(ReadContextMembership(reader));
+        }
+        return results;
+    }
+
+    private static ContextMembership ReadContextMembership(SqliteDataReader reader) => new()
+    {
+        ContextMembershipId = reader.GetString(0),
+        RunId = reader.GetString(1),
+        ContextCandidateId = reader.GetString(2),
+        NodeId = reader.GetString(3),
+        Role = Enum.Parse<ContextMembershipRole>(reader.GetString(4)),
+        EvidenceIds = JsonSerializer.Deserialize<List<string>>(reader.GetString(5), JsonOptions) ?? new List<string>(),
+        CreatedAtUtc = DateTimeOffset.Parse(reader.GetString(6)),
+    };
+
+    public async Task AppendContextDependencyEdgeAsync(ContextDependencyEdge edge, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+INSERT INTO context_dependency_edges
+    (context_dependency_edge_id, run_id, from_context_candidate_id, to_context_candidate_id,
+     evidence_ids_json, confidence, created_at_utc)
+VALUES
+    ($contextDependencyEdgeId, $runId, $fromContextCandidateId, $toContextCandidateId,
+     $evidenceIdsJson, $confidence, $createdAtUtc);";
+        command.Parameters.AddWithValue("$contextDependencyEdgeId", edge.ContextDependencyEdgeId);
+        command.Parameters.AddWithValue("$runId", edge.RunId);
+        command.Parameters.AddWithValue("$fromContextCandidateId", edge.FromContextCandidateId);
+        command.Parameters.AddWithValue("$toContextCandidateId", edge.ToContextCandidateId);
+        command.Parameters.AddWithValue("$evidenceIdsJson", JsonSerializer.Serialize(edge.EvidenceIds, JsonOptions));
+        command.Parameters.AddWithValue("$confidence", edge.Confidence);
+        command.Parameters.AddWithValue("$createdAtUtc", edge.CreatedAtUtc.ToString("O"));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<ContextDependencyEdge>> GetContextDependencyEdgesAsync(string runId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+SELECT context_dependency_edge_id, run_id, from_context_candidate_id, to_context_candidate_id,
+       evidence_ids_json, confidence, created_at_utc
+FROM context_dependency_edges WHERE run_id = $runId ORDER BY created_at_utc;";
+        command.Parameters.AddWithValue("$runId", runId);
+        var results = new List<ContextDependencyEdge>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            results.Add(ReadContextDependencyEdge(reader));
+        }
+        return results;
+    }
+
+    private static ContextDependencyEdge ReadContextDependencyEdge(SqliteDataReader reader) => new()
+    {
+        ContextDependencyEdgeId = reader.GetString(0),
+        RunId = reader.GetString(1),
+        FromContextCandidateId = reader.GetString(2),
+        ToContextCandidateId = reader.GetString(3),
+        EvidenceIds = JsonSerializer.Deserialize<List<string>>(reader.GetString(4), JsonOptions) ?? new List<string>(),
+        Confidence = reader.GetDouble(5),
+        CreatedAtUtc = DateTimeOffset.Parse(reader.GetString(6)),
+    };
 }

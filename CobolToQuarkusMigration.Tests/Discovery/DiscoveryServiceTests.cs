@@ -259,5 +259,111 @@ public sealed class DiscoveryServiceTests : IDisposable
         var all = await _service.GetRoleAssignmentsAsync(run.RunId);
         all.Should().HaveCount(4);
     }
+
+    [Fact]
+    public async Task AppendDependencyGraphAsync_PersistsNodesEdgesWithEvidenceAndProvenance()
+    {
+        var run = await _service.StartRunAsync("Subject", "/tmp", "rev1", Array.Empty<string>(), Array.Empty<string>(), "Static source only");
+        var artifact = await _service.AppendArtifactAsync(run.RunId, "Domain/Widget.cs", "CSharp", "h1");
+
+        var nodeCandidates = new List<(CobolToQuarkusMigration.Discovery.Graph.GraphNodeCandidate, string?)>
+        {
+            (new CobolToQuarkusMigration.Discovery.Graph.GraphNodeCandidate(
+                GraphNodeKind.Type, "App.Domain.Widget", "Widget", artifact.Path,
+                new[] { new CobolToQuarkusMigration.Discovery.Graph.GraphEvidenceCitation("TypeDeclaration", "Domain/Widget.cs:L1", "Type 'Widget' declared.") }),
+             artifact.ArtifactId),
+            (new CobolToQuarkusMigration.Discovery.Graph.GraphNodeCandidate(
+                GraphNodeKind.Type, "App.Domain.Gadget", "Gadget", artifact.Path,
+                new[] { new CobolToQuarkusMigration.Discovery.Graph.GraphEvidenceCitation("TypeDeclaration", "Domain/Widget.cs:L5", "Type 'Gadget' declared.") }),
+             artifact.ArtifactId),
+        };
+        var edgeCandidates = new List<CobolToQuarkusMigration.Discovery.Graph.GraphEdgeCandidate>
+        {
+            new(GraphEdgeKind.References, "App.Domain.Widget", "App.Domain.Gadget", 0.8,
+                new[] { new CobolToQuarkusMigration.Discovery.Graph.GraphEvidenceCitation("CrossTypeReference", "Domain/Widget.cs:L3", "'Widget' references 'Gadget'.") }),
+        };
+
+        var (nodes, edges) = await _service.AppendDependencyGraphAsync(run.RunId, nodeCandidates, edgeCandidates, producerVersion: "test-graph-builder-v1");
+
+        nodes.Should().HaveCount(2);
+        edges.Should().ContainSingle();
+        foreach (var node in nodes)
+        {
+            node.EvidenceIds.Should().NotBeEmpty();
+        }
+        edges.Single().EvidenceIds.Should().NotBeEmpty();
+
+        var persistedNodes = await _service.GetGraphNodesAsync(run.RunId);
+        var persistedEdges = await _service.GetGraphEdgesAsync(run.RunId);
+        persistedNodes.Should().HaveCount(2);
+        persistedEdges.Should().ContainSingle();
+
+        // Re-appending the same symbol locator does not duplicate the node (idempotent per run).
+        var (nodesAgain, _) = await _service.AppendDependencyGraphAsync(run.RunId, nodeCandidates, Array.Empty<CobolToQuarkusMigration.Discovery.Graph.GraphEdgeCandidate>(), producerVersion: "test-graph-builder-v1");
+        nodesAgain.Should().BeEmpty();
+        (await _service.GetGraphNodesAsync(run.RunId)).Should().HaveCount(2);
+    }
+
+    [Fact]
+    public async Task SeedContextCandidatesAsync_ProducesEvidenceBackedCandidatesWithMembershipAndStatus()
+    {
+        var run = await _service.StartRunAsync("Subject", "/tmp", "rev1", Array.Empty<string>(), Array.Empty<string>(), "Static source only");
+        var artifact = await _service.AppendArtifactAsync(run.RunId, "Forecast/ForecastService.cs", "CSharp", "h1");
+
+        var nodeCandidates = new List<(CobolToQuarkusMigration.Discovery.Graph.GraphNodeCandidate, string?)>
+        {
+            (new CobolToQuarkusMigration.Discovery.Graph.GraphNodeCandidate(
+                GraphNodeKind.Type, "App.Forecast.ForecastService", "ForecastService", artifact.Path,
+                new[] { new CobolToQuarkusMigration.Discovery.Graph.GraphEvidenceCitation("TypeDeclaration", "Forecast/ForecastService.cs:L1", "Type 'ForecastService' declared.") }),
+             artifact.ArtifactId),
+        };
+
+        await _service.AppendDependencyGraphAsync(run.RunId, nodeCandidates, Array.Empty<CobolToQuarkusMigration.Discovery.Graph.GraphEdgeCandidate>(), producerVersion: "test-graph-builder-v1");
+
+        var candidates = await _service.SeedContextCandidatesAsync(run.RunId, producerVersion: "test-context-seeder-v1");
+
+        candidates.Should().ContainSingle();
+        var candidate = candidates[0];
+        candidate.Name.Should().Be("Forecast");
+        candidate.Kind.Should().Be(ContextCandidateKind.BusinessContext);
+        // Never authoritative: seeding must never mark a candidate Published.
+        candidate.Status.Should().BeOneOf(ReviewStatus.Candidate, ReviewStatus.NeedsEvidence);
+        candidate.EvidenceIds.Should().NotBeEmpty();
+        candidate.SeedingRule.Should().NotBeNullOrWhiteSpace();
+
+        var memberships = await _service.GetContextMembershipsForContextAsync(candidate.ContextCandidateId);
+        memberships.Should().ContainSingle();
+        memberships[0].EvidenceIds.Should().NotBeEmpty();
+
+        var persistedCandidates = await _service.GetContextCandidatesAsync(run.RunId);
+        persistedCandidates.Should().HaveCount(1);
+    }
+
+    [Fact]
+    public async Task SeedContextCandidatesAsync_SharedInfrastructureNodesExcludedFromBusinessContexts()
+    {
+        var run = await _service.StartRunAsync("Subject", "/tmp", "rev1", Array.Empty<string>(), Array.Empty<string>(), "Static source only");
+        var artifact = await _service.AppendArtifactAsync(run.RunId, "Platform/StartupExtensions.cs", "CSharp", "h1");
+
+        var artifacts = new List<(SourceArtifact, string)>
+        {
+            (artifact, "namespace App.Platform; public static class StartupExtensions { public static void AddServices(Microsoft.Extensions.DependencyInjection.IServiceCollection services) { services.AddScoped<IFoo, Foo>(); } }"),
+        };
+        await _service.ClassifyArtifactRolesAsync(run.RunId, artifacts, producerVersion: "test-classifier-v1");
+
+        var nodeCandidates = new List<(CobolToQuarkusMigration.Discovery.Graph.GraphNodeCandidate, string?)>
+        {
+            (new CobolToQuarkusMigration.Discovery.Graph.GraphNodeCandidate(
+                GraphNodeKind.Type, "App.Platform.StartupExtensions", "StartupExtensions", artifact.Path,
+                new[] { new CobolToQuarkusMigration.Discovery.Graph.GraphEvidenceCitation("TypeDeclaration", "Platform/StartupExtensions.cs:L1", "Type 'StartupExtensions' declared.") }),
+             artifact.ArtifactId),
+        };
+        await _service.AppendDependencyGraphAsync(run.RunId, nodeCandidates, Array.Empty<CobolToQuarkusMigration.Discovery.Graph.GraphEdgeCandidate>(), producerVersion: "test-graph-builder-v1");
+
+        var candidates = await _service.SeedContextCandidatesAsync(run.RunId, producerVersion: "test-context-seeder-v1");
+
+        candidates.Should().ContainSingle();
+        candidates[0].Kind.Should().Be(ContextCandidateKind.SharedInfrastructure);
+    }
 }
 

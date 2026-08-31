@@ -6531,6 +6531,57 @@ app.MapPost("/api/discovery/findings/{findingRevisionId}/request-evidence", asyn
 	}
 });
 
+// ---------------------------------------------------------------------------
+// Discovery Factory phase 5: candidate logical context / module boundary review (issue #3).
+// Read-only browse surface; publish/reject remains a future portal addition — reviewers confirm
+// contexts out-of-band today, consistent with "portal UI changes are trivially additive" scope.
+// ---------------------------------------------------------------------------
+
+app.MapGet("/api/discovery/runs/{runId}/contexts", async (string runId, CobolToQuarkusMigration.Discovery.DiscoveryService svc) =>
+{
+	var candidates = await svc.GetContextCandidatesAsync(runId);
+	var dependencyEdges = await svc.GetContextDependencyEdgesAsync(runId);
+	var candidateNames = candidates.ToDictionary(c => c.ContextCandidateId, c => c.Name);
+
+	var items = new List<object>();
+	foreach (var candidate in candidates.OrderByDescending(c => c.Confidence))
+	{
+		var memberships = await svc.GetContextMembershipsForContextAsync(candidate.ContextCandidateId);
+		var evidence = await svc.GetEvidenceByIdsAsync(candidate.EvidenceIds);
+
+		items.Add(new
+		{
+			candidate.ContextCandidateId,
+			candidate.Name,
+			Kind = candidate.Kind.ToString(),
+			Status = candidate.Status.ToString(),
+			candidate.Confidence,
+			candidate.SeedingRule,
+			MemberCount = memberships.Count,
+			OwnerCount = memberships.Count(m => m.Role == CobolToQuarkusMigration.Discovery.Models.ContextMembershipRole.Owner),
+			Members = memberships.Select(m => new { m.NodeId, Role = m.Role.ToString() }),
+			Evidence = evidence.Select(e => new
+			{
+				e.EvidenceId,
+				Type = e.Type.ToString(),
+				e.RedactedExcerpt,
+				e.WasRedacted,
+				e.RedactionSummary
+			}),
+			candidate.CreatedAtUtc
+		});
+	}
+
+	var dependencies = dependencyEdges.Select(edge => new
+	{
+		From = candidateNames.GetValueOrDefault(edge.FromContextCandidateId, edge.FromContextCandidateId),
+		To = candidateNames.GetValueOrDefault(edge.ToContextCandidateId, edge.ToContextCandidateId),
+		edge.Confidence
+	});
+
+	return Results.Ok(new { contexts = items, dependencies });
+});
+
 app.Run();
 
 /// <summary>Request body for Discovery review-queue decision endpoints.</summary>

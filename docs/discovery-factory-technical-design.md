@@ -1,4 +1,4 @@
-**Last updated**: 2026-08-30
+**Last updated**: 2026-09-06
 
 # Discovery Factory technical design
 
@@ -629,5 +629,134 @@ not change the deferred decisions in §12.
   non-business role, sets `RequiresReview = true` and receives reduced confidence — the
   classifier never collapses conflicting evidence into a single guessed role (issue #8
   scope item 3).
+- **Phase 5 (issue #3) reuses `ReviewStatus` rather than introducing a dedicated context
+  lifecycle enum.** Candidate contexts are governed `ContextCandidate` records whose
+  `Status` is the existing finding `ReviewStatus` enum: `Candidate` (Plausible, confidence
+  ≥ 0.55) or `NeedsEvidence` (Unconfirmed, confidence < 0.55). `Published`/`Rejected` are
+  reachable only through the same human-review path used for findings (§5.4); nothing in
+  `ContextSeeder`/`DiscoveryService.SeedContextCandidatesAsync` can move a candidate past
+  `Candidate`, matching the constraint that LLM/heuristic output may explain and
+  prioritize but never establish or publish a context claim.
+- **Dependency graph is syntax-tree-only, like Phase 4's role classifier.**
+  `Discovery/Graph/DependencyGraphBuilder.cs` builds project-level nodes/edges from
+  `.csproj` `ProjectReference` elements and type-level nodes/edges (`ContainsType`,
+  `References`, `Injects`, `MapsToEntity`, `ExposesRoute`) by parsing each `.cs` file with
+  Roslyn `CSharpSyntaxTree` — no `CSharpCompilation`/`SemanticModel` is built. `References`
+  edges are therefore a same-name identifier-reference proxy (as in the Phase 4 `Shared`
+  fan-in heuristic), not resolved symbol binding; two distinct types sharing a name in
+  different namespaces could be conflated. This is an accepted limitation for this phase;
+  full semantic analysis remains deferred per §12.
+- **Context seeding never equates a project or controller with a context.**
+  `Discovery/Graph/ContextSeeder.cs` clusters `Type` graph nodes by a namespace-segment
+  heuristic (`ClusterKey`) that skips a fixed list of technical segment names (Controllers,
+  Services, Models, Repositories, etc.) and clusters on the first remaining, more
+  domain-specific segment — so a controller, its DTOs, and its repository in different
+  projects can land in the same candidate context, and a single project spanning multiple
+  domains yields multiple candidates. Each candidate's `EvidenceIds` (persisted by
+  `DiscoveryService.SeedContextCandidatesAsync`) include both the cross-cluster graph-edge
+  evidence and each member node's own declaration evidence, so even an edge-free singleton
+  cluster carries at least one citation — satisfying "every context claim has stable
+  finding links and citations" even in the sparsest case.
+- **Shared/infrastructure nodes are excluded from business-context clustering by
+  construction.** `ContextSeeder` reuses the Phase 4 `RoleAssignment`s (passed in as an
+  input signal, not re-derived) to classify each candidate cluster as `BusinessContext` or
+  `SharedInfrastructure`: a cluster is `SharedInfrastructure` only if none of its member
+  types carry a `Business`/`Unknown`-leaning role and at least one carries a recognized
+  infrastructure tag (CompositionDI, Middleware, FrameworkAdapter, Persistence/EF,
+  IntegrationAdapter, Shared, Generated, Test, BuildTooling); mixed clusters remain
+  `BusinessContext` so the mixed boundary stays visible rather than silently discarded.
+- **Live PlanBoard run validates the whole-solution + Forecast Management acceptance
+  criteria.** `discovery build-graph --source-dir <PlanBoard path>` was run against the
+  real, local PlanBoard checkout (14 projects, 354 `.cs` files), producing 553 graph nodes
+  (14 Project, 65 Namespace, 298 Type, 163 Route, 13 DbEntity) and 1,601 graph edges across
+  `DependsOnProject`, `ContainsType`, `References`, `MapsToEntity`, and `ExposesRoute`.
+  `discovery seed-contexts` then produced 22 candidate contexts spanning the whole
+  solution — including a `ForecastApprovals` candidate (confidence 0.70, rule
+  `NamespaceCoLocation;NamingConvention;CouplingDensity`) whose membership and evidence
+  cite real PlanBoard source such as
+  `Planbordv2.WebApp/Controllers/ForecastApprovalController.cs` and
+  `Planbordv2.Models/ViewModels/ForecastApprovals/ForecastApproveData.cs` — plus 50
+  cross-context dependency edges (e.g. `ForecastApprovals -> Planbordv2`) that keep
+  cross-cutting/platform coupling visible rather than merged into a context. All
+  candidates remained `Candidate`/`NeedsEvidence` (never `Published`); no PlanBoard source
+  was copied into this repository, only governed records citing it.
+- **Minimal portal UI addition for context review.** `McpChatWeb/wwwroot/
+  discovery-contexts.html`/`.js` is a new, additive page (same style as the existing
+  `discovery-review.html` review queue) that lists candidate contexts with confidence,
+  kind (Business/Shared), Plausible/Unconfirmed status, membership, and evidence, plus the
+  cross-context dependency table, backed by a new
+  `GET /api/discovery/runs/{runId}/contexts` endpoint. The existing review-queue page is
+  unchanged except for one added navigation link; it is not otherwise modified or
+  regressed.
+- **Refinement: framework-namespace hard filter and root-catch-all fix (post-pilot review
+  finding).** The first live PlanBoard run above was seeded with an empty
+  `role_assignments` table for that run (`discovery classify-roles` had not yet been run
+  against the same `--run-id`), and `ContextSeeder.IsBusinessDominant` conservatively
+  treats a symbol with no role assignment as business-eligible (§ above) — so every
+  cluster, including purely framework-owned ones, seeded as `BusinessContext`. Two fixes
+  landed as a result:
+  - **`Discovery/Graph/FrameworkNamespaces.cs`** is a new, documented, sourced reference of
+    authoritative BCL/ASP.NET Core/`Microsoft.Extensions.*`/EF Core/Azure SDK namespace
+    roots (`System`, `Microsoft.AspNetCore`, `Microsoft.Extensions`,
+    `Microsoft.EntityFrameworkCore`, `Microsoft.Identity`, `Microsoft.Graph`,
+    `Microsoft.Data`, `Azure`), cited from the official Microsoft .NET API namespace
+    documentation (see in-code XML doc comments for the exact `learn.microsoft.com` URLs
+    per root) — not guessed or inferred. `ContextSeeder.SeedCandidates` now applies this as
+    a hard pre-filter: any cluster whose members are majority-declared (≥50%) inside a
+    framework namespace root is tagged `SharedInfrastructure` regardless of whether role
+    assignments exist for those symbols, adding defense-in-depth independent of whether
+    `classify-roles` was run. This is a namespace-*text* pre-filter on each symbol's own
+    declared namespace (not a resolved-symbol/assembly-identity check via
+    `CSharpCompilation`/`SemanticModel`, which remains out of scope per §12/the syntax-tree-
+    only limitation already noted above) — so it deliberately still flags the case where
+    PlanBoard's own code is declared inside a reserved framework namespace (e.g. a custom
+    type under `Microsoft.Extensions.Hosting`) as a `SharedInfrastructure` cluster, with
+    that declaration preserved as evidence — a real code smell worth surfacing, not a false
+    negative to hide.
+  - **`ContextSeeder.ClusterKey`'s root-namespace fallback** previously collapsed to the
+    bare namespace root (e.g. `Planbordv2`) whenever every remaining segment was a
+    known technical/layer name, mixing unrelated technical concerns (DbContext, Worker,
+    Telemetry, test utilities) into one high-confidence candidate. It now falls back to
+    root **plus the first technical segment** (e.g. `Planbordv2.Worker`,
+    `Planbordv2.DataAccess`) instead of the bare root, and any such fallback cluster is
+    tagged with a new `TechnicalCatchAll` seeding rule and capped at confidence 0.45 (always
+    `NeedsEvidence`/Unconfirmed) — surfacing it as an explicit low-cohesion/needs-review
+    cluster rather than a confident business-context claim.
+  - **Re-run against the real PlanBoard checkout** (run `RUN-5E7AA1A1`, this time running
+    `classify-roles` before `build-graph`/`seed-contexts` in the correct order) reproduced
+    the same graph shape (553 nodes / 1,601 edges) and produced 28 candidate contexts in
+    the latest seeding batch: 3 `SharedInfrastructure` (`Hosting` — confirmed to be the
+    PlanBoard-code-in-framework-namespace case, evidence preserved; `Data`; the
+    `Planbordv2.DatabaseMigration` catch-all) and 25 `BusinessContext`, including the
+    now-split `Planbordv2.Api`/`.DataAccess`/`.Worker`/`.Utilities`/`.WebApp`/`.Models`
+    catch-all clusters (each capped at 0.45/`NeedsEvidence`) in place of the single
+    0.90-confidence `Planbordv2` cluster from the first run. `ForecastApprovals` remained
+    intact and evidence-backed (confidence 0.70, `Candidate`/Plausible, 2 members citing
+    `Planbordv2.Models/ViewModels/ForecastApprovals/ForecastApproveData.cs` and
+    `ForecastApprovalViewModel.cs`). `Options`/`Helpers`/`Attributes` are PlanBoard's own
+    namespaces (not BCL/ASP.NET/EF/Azure), so they correctly remain outside the framework
+    filter, staying visible as small, lower-confidence `BusinessContext` candidates for
+    human review rather than being hidden.
+  - Tests added: `CobolToQuarkusMigration.Tests/Discovery/FrameworkNamespacesTests.cs`
+    (namespace-root matching) and new cases in `ContextSeederTests.cs` covering
+    framework-namespace-dominant exclusion with no role data, the PlanBoard-code-in-
+    framework-namespace edge case, a mixed-namespace cluster, and the
+    `TechnicalCatchAll` root-fallback split.
+  - **Known limitation (not fixed in this pass):** generic/cross-cutting namespace
+    segments — e.g. `Shared`, `Common`, `Core`, `Utilities`, `Infrastructure` — can still
+    seed as a confident `BusinessContext` candidate. Manual review of the PlanBoard run
+    found a `Shared` cluster (confidence 0.86, 6 members including
+    `NotificationOutboxRepository` and a shared view model) scored purely on
+    `NamespaceCoLocation`/`CouplingDensity` signals, the same way any other repeated
+    namespace segment (e.g. `Employees`) would be scored. Unlike the `Hosting` case, this
+    is not a framework-namespace problem — `Shared` is PlanBoard's own namespace — so the
+    framework-namespace hard filter correctly does not (and should not) touch it. The
+    seeder currently has no signal for "this segment name is a generic/cross-cutting
+    bucket, not a specific business capability," regardless of how strong its coupling or
+    co-location signal is. Deferred rather than fixed now to avoid inventing another ad
+    hoc heuristic; a good candidate for a future LLM-assisted triage pass that
+    *prioritizes/explains* review attention on such ambiguous clusters — consistent with
+    the existing non-authoritative-LLM constraint (LLM may explain and prioritize, never
+    reclassify or publish a context claim on its own).
 
 
