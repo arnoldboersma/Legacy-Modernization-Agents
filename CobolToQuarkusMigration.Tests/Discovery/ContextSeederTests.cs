@@ -152,4 +152,92 @@ public sealed class ContextSeederTests
 
         result.Candidates.Should().ContainSingle().Which.Confidence.Should().BeInRange(0.0, 0.9);
     }
+
+    [Fact]
+    public void SeedCandidates_FrameworkNamespaceDominantCluster_SeedsSharedInfrastructure_EvenWithoutRoleAssignments()
+    {
+        // No role assignments at all (e.g. classify-roles was never run for this artifact):
+        // the framework-namespace hard filter must still exclude this from BusinessContext.
+        var nodes = new[]
+        {
+            Node("N1", GraphNodeKind.Type, "Microsoft.Extensions.Hosting.HostBuilderExtensions", "HostBuilderExtensions"),
+            Node("N2", GraphNodeKind.Type, "Microsoft.Extensions.Hosting.OptionsSetup", "OptionsSetup"),
+        };
+
+        var result = ContextSeeder.SeedCandidates(nodes, Array.Empty<DependencyGraphEdge>(), Array.Empty<RoleAssignment>());
+
+        var candidate = result.Candidates.Should().ContainSingle().Subject;
+        candidate.Kind.Should().Be(ContextCandidateKind.SharedInfrastructure);
+        candidate.SeedingRule.Should().Contain("FrameworkNamespaceFilter");
+    }
+
+    [Fact]
+    public void SeedCandidates_PlanBoardCodeDeclaredInFrameworkNamespace_RecordedAsSharedInfraEvidence_NotHidden()
+    {
+        // Mirrors the real PlanBoard case: PrefixKeyVaultSecretManager/InstrumentationSource/
+        // Extensions are PlanBoard's own types but declared inside Microsoft.Extensions.Hosting.
+        // This is a real code smell that must still be recorded — as evidence on a
+        // SharedInfrastructure cluster, not silently folded into a business context.
+        var nodes = new[]
+        {
+            Node("N1", GraphNodeKind.Type, "Microsoft.Extensions.Hosting.PrefixKeyVaultSecretManager", "PrefixKeyVaultSecretManager"),
+            Node("N2", GraphNodeKind.Type, "Microsoft.Extensions.Hosting.InstrumentationSource", "InstrumentationSource"),
+            Node("N3", GraphNodeKind.Type, "Microsoft.Extensions.Hosting.Extensions", "Extensions"),
+        };
+
+        var result = ContextSeeder.SeedCandidates(nodes, Array.Empty<DependencyGraphEdge>(), Array.Empty<RoleAssignment>());
+
+        var candidate = result.Candidates.Should().ContainSingle().Subject;
+        candidate.Kind.Should().Be(ContextCandidateKind.SharedInfrastructure);
+        candidate.MemberNodeIds.Should().BeEquivalentTo(new[] { "N1", "N2", "N3" });
+    }
+
+    [Fact]
+    public void SeedCandidates_MixedFrameworkAndOwnNamespaceCluster_MajorityFrameworkStillSharedInfrastructure()
+    {
+        var nodes = new[]
+        {
+            Node("N1", GraphNodeKind.Type, "System.Text.Json.CustomConverter", "CustomConverter"),
+            Node("N2", GraphNodeKind.Type, "System.Text.Json.AnotherConverter", "AnotherConverter"),
+        };
+
+        var result = ContextSeeder.SeedCandidates(nodes, Array.Empty<DependencyGraphEdge>(), Array.Empty<RoleAssignment>());
+
+        result.Candidates.Should().ContainSingle().Which.Kind.Should().Be(ContextCandidateKind.SharedInfrastructure);
+    }
+
+    [Fact]
+    public void SeedCandidates_RootNamespaceTechnicalCatchAll_FlaggedAndCappedConfidence_NotHighConfidenceBusinessContext()
+    {
+        // All non-root segments are well-known technical/layer names (Worker, DataAccess,
+        // Extensions): this must not collapse into a single incoherent high-confidence
+        // "Planbordv2" business context (the real bug seen against PlanBoard).
+        var nodes = new[]
+        {
+            Node("N1", GraphNodeKind.Type, "Planbordv2.Worker.BackgroundJob", "BackgroundJob"),
+            Node("N2", GraphNodeKind.Type, "Planbordv2.Worker.JobScheduler", "JobScheduler"),
+        };
+
+        var result = ContextSeeder.SeedCandidates(nodes, Array.Empty<DependencyGraphEdge>(), Array.Empty<RoleAssignment>());
+
+        var candidate = result.Candidates.Should().ContainSingle().Subject;
+        candidate.SeedingRule.Should().Contain("TechnicalCatchAll");
+        candidate.Confidence.Should().BeLessOrEqualTo(0.45);
+        candidate.Name.Should().Be("Planbordv2.Worker");
+    }
+
+    [Fact]
+    public void SeedCandidates_RootNamespaceTechnicalCatchAll_SplitsDistinctTechnicalSegmentsIntoSeparateClusters()
+    {
+        var nodes = new[]
+        {
+            Node("N1", GraphNodeKind.Type, "Planbordv2.Worker.BackgroundJob", "BackgroundJob"),
+            Node("N2", GraphNodeKind.Type, "Planbordv2.DataAccess.ApplicationContext", "ApplicationContext"),
+        };
+
+        var result = ContextSeeder.SeedCandidates(nodes, Array.Empty<DependencyGraphEdge>(), Array.Empty<RoleAssignment>());
+
+        result.Candidates.Select(c => c.Name).Should().BeEquivalentTo(new[] { "Planbordv2.Worker", "Planbordv2.DataAccess" });
+        result.Candidates.Should().OnlyContain(c => c.SeedingRule.Contains("TechnicalCatchAll"));
+    }
 }

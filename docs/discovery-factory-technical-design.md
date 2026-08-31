@@ -688,5 +688,59 @@ not change the deferred decisions in §12.
   `GET /api/discovery/runs/{runId}/contexts` endpoint. The existing review-queue page is
   unchanged except for one added navigation link; it is not otherwise modified or
   regressed.
+- **Refinement: framework-namespace hard filter and root-catch-all fix (post-pilot review
+  finding).** The first live PlanBoard run above was seeded with an empty
+  `role_assignments` table for that run (`discovery classify-roles` had not yet been run
+  against the same `--run-id`), and `ContextSeeder.IsBusinessDominant` conservatively
+  treats a symbol with no role assignment as business-eligible (§ above) — so every
+  cluster, including purely framework-owned ones, seeded as `BusinessContext`. Two fixes
+  landed as a result:
+  - **`Discovery/Graph/FrameworkNamespaces.cs`** is a new, documented, sourced reference of
+    authoritative BCL/ASP.NET Core/`Microsoft.Extensions.*`/EF Core/Azure SDK namespace
+    roots (`System`, `Microsoft.AspNetCore`, `Microsoft.Extensions`,
+    `Microsoft.EntityFrameworkCore`, `Microsoft.Identity`, `Microsoft.Graph`,
+    `Microsoft.Data`, `Azure`), cited from the official Microsoft .NET API namespace
+    documentation (see in-code XML doc comments for the exact `learn.microsoft.com` URLs
+    per root) — not guessed or inferred. `ContextSeeder.SeedCandidates` now applies this as
+    a hard pre-filter: any cluster whose members are majority-declared (≥50%) inside a
+    framework namespace root is tagged `SharedInfrastructure` regardless of whether role
+    assignments exist for those symbols, adding defense-in-depth independent of whether
+    `classify-roles` was run. This is a namespace-*text* pre-filter on each symbol's own
+    declared namespace (not a resolved-symbol/assembly-identity check via
+    `CSharpCompilation`/`SemanticModel`, which remains out of scope per §12/the syntax-tree-
+    only limitation already noted above) — so it deliberately still flags the case where
+    PlanBoard's own code is declared inside a reserved framework namespace (e.g. a custom
+    type under `Microsoft.Extensions.Hosting`) as a `SharedInfrastructure` cluster, with
+    that declaration preserved as evidence — a real code smell worth surfacing, not a false
+    negative to hide.
+  - **`ContextSeeder.ClusterKey`'s root-namespace fallback** previously collapsed to the
+    bare namespace root (e.g. `Planbordv2`) whenever every remaining segment was a
+    known technical/layer name, mixing unrelated technical concerns (DbContext, Worker,
+    Telemetry, test utilities) into one high-confidence candidate. It now falls back to
+    root **plus the first technical segment** (e.g. `Planbordv2.Worker`,
+    `Planbordv2.DataAccess`) instead of the bare root, and any such fallback cluster is
+    tagged with a new `TechnicalCatchAll` seeding rule and capped at confidence 0.45 (always
+    `NeedsEvidence`/Unconfirmed) — surfacing it as an explicit low-cohesion/needs-review
+    cluster rather than a confident business-context claim.
+  - **Re-run against the real PlanBoard checkout** (run `RUN-5E7AA1A1`, this time running
+    `classify-roles` before `build-graph`/`seed-contexts` in the correct order) reproduced
+    the same graph shape (553 nodes / 1,601 edges) and produced 28 candidate contexts in
+    the latest seeding batch: 3 `SharedInfrastructure` (`Hosting` — confirmed to be the
+    PlanBoard-code-in-framework-namespace case, evidence preserved; `Data`; the
+    `Planbordv2.DatabaseMigration` catch-all) and 25 `BusinessContext`, including the
+    now-split `Planbordv2.Api`/`.DataAccess`/`.Worker`/`.Utilities`/`.WebApp`/`.Models`
+    catch-all clusters (each capped at 0.45/`NeedsEvidence`) in place of the single
+    0.90-confidence `Planbordv2` cluster from the first run. `ForecastApprovals` remained
+    intact and evidence-backed (confidence 0.70, `Candidate`/Plausible, 2 members citing
+    `Planbordv2.Models/ViewModels/ForecastApprovals/ForecastApproveData.cs` and
+    `ForecastApprovalViewModel.cs`). `Options`/`Helpers`/`Attributes` are PlanBoard's own
+    namespaces (not BCL/ASP.NET/EF/Azure), so they correctly remain outside the framework
+    filter, staying visible as small, lower-confidence `BusinessContext` candidates for
+    human review rather than being hidden.
+  - Tests added: `CobolToQuarkusMigration.Tests/Discovery/FrameworkNamespacesTests.cs`
+    (namespace-root matching) and new cases in `ContextSeederTests.cs` covering
+    framework-namespace-dominant exclusion with no role data, the PlanBoard-code-in-
+    framework-namespace edge case, a mixed-namespace cluster, and the
+    `TechnicalCatchAll` root-fallback split.
 
 

@@ -78,10 +78,25 @@ public static class ContextSeeder
             var members = cluster.ToList();
             var memberNodeIds = members.Select(m => m.NodeId).ToList();
 
+            var frameworkNamespaceCount = members.Count(m => FrameworkNamespaces.IsFrameworkNamespace(FrameworkNamespaces.GetNamespace(m.SymbolLocator)));
+            var isFrameworkNamespaceDominant = frameworkNamespaceCount > 0 && frameworkNamespaceCount * 2 >= members.Count;
+
             var businessCount = members.Count(m => IsBusinessDominant(m.SymbolLocator, rolesBySymbol, sharedInfraTags));
-            var isSharedInfraDominant = businessCount == 0;
+            var isSharedInfraDominant = isFrameworkNamespaceDominant || businessCount == 0;
 
             var seedingRules = new List<string> { "NamespaceCoLocation", "NamingConvention" };
+            if (isFrameworkNamespaceDominant)
+            {
+                // Hard, sourced pre-filter (design doc §14): a cluster whose members are
+                // majority-declared inside an authoritative framework namespace root (System.*,
+                // Microsoft.Extensions.*, Microsoft.AspNetCore.*, Microsoft.EntityFrameworkCore.*,
+                // Azure.*, ...) is tagged SharedInfrastructure regardless of role-assignment
+                // availability. When PlanBoard's own code is declared inside such a reserved
+                // namespace (e.g. a custom type under Microsoft.Extensions.Hosting), that is
+                // preserved here as evidence of a real code smell on the Shared/Infra cluster
+                // rather than silently folded into a business context.
+                seedingRules.Add("FrameworkNamespaceFilter");
+            }
 
             // Ownership: a node is "owned" by this cluster when it is referenced only from within
             // the cluster's own member set (no external in-edge from a Type node outside the cluster).
@@ -109,6 +124,17 @@ public static class ContextSeeder
             // cohesion raise confidence; mixed/ambiguous clusters (low cohesion, no clear owner)
             // stay lower confidence and remain Unconfirmed rather than forced into one grouping.
             var confidence = Math.Clamp(0.4 + (0.15 * (seedingRules.Count - 1)) + (0.2 * cohesion), 0.3, 0.9);
+
+            var isTechnicalCatchAll = IsTechnicalCatchAll(members);
+            if (isTechnicalCatchAll)
+            {
+                // Root+technical-segment fallback cluster (e.g. "Planbordv2.Worker"): this is not
+                // a genuine business-naming signal, just "whatever technical layer sits directly
+                // under the product root". Flag it explicitly and cap confidence so it surfaces
+                // as a low-cohesion/needs-review candidate rather than a high-confidence context.
+                seedingRules.Add("TechnicalCatchAll");
+                confidence = Math.Min(confidence, 0.45);
+            }
 
             var evidenceEdgeIds = touchingEdges.Select(e => e.EdgeId).Distinct().ToList();
 
@@ -173,8 +199,12 @@ public static class ContextSeeder
     /// <summary>
     /// Derives the deterministic clustering key for a namespace-qualified symbol locator: the
     /// first namespace segment that is not a well-known technical/layer segment name, i.e. the
-    /// proxy for "repeated naming and co-location" per §5.1. Falls back to the full leading
-    /// namespace prefix (assembly root) when every segment is a technical name.
+    /// proxy for "repeated naming and co-location" per §5.1. When every segment beneath the root
+    /// is a technical name (e.g. <c>Planbordv2.Worker</c>, <c>Planbordv2.DataAccess</c>), the root
+    /// alone is never used as the key on its own: it is joined with the first technical segment
+    /// (e.g. <c>Planbordv2.Worker</c>, <c>Planbordv2.DataAccess</c>) so that unrelated technical
+    /// concerns sitting directly under the product root do not collapse into a single
+    /// high-confidence catch-all cluster (design doc §14 — the "Planbordv2 root catch-all" fix).
     /// </summary>
     private static string ClusterKey(string symbolLocator)
     {
@@ -194,7 +224,34 @@ public static class ContextSeeder
             }
         }
 
-        return segments[0];
+        // Every non-root segment is a technical/layer name: rather than collapsing to the bare
+        // root (which would mix DbContext/Worker/Telemetry/etc. into one cluster), keep the root
+        // distinguished by its first technical segment so each technical concern remains its own,
+        // separately-reviewable, lower-confidence cluster instead of one incoherent catch-all.
+        return segments.Length > 1 ? $"{segments[0]}.{segments[1]}" : segments[0];
+    }
+
+    /// <summary>
+    /// True when every non-root namespace segment of every member is a well-known technical/layer
+    /// name (i.e. the cluster only exists because <see cref="ClusterKey"/> had to fall back to a
+    /// root+technical-segment key rather than a genuine business-looking segment). Such clusters
+    /// are inherently low-cohesion/needs-review: they are not a business concept, just "whatever
+    /// sits directly under the product root with this technical layer name".
+    /// </summary>
+    private static bool IsTechnicalCatchAll(IEnumerable<DependencyGraphNode> members)
+    {
+        foreach (var member in members)
+        {
+            var lastDot = member.SymbolLocator.LastIndexOf('.');
+            var ns = lastDot >= 0 ? member.SymbolLocator[..lastDot] : string.Empty;
+            var segments = ns.Split('.', StringSplitOptions.RemoveEmptyEntries);
+            if (segments.Skip(1).Any(s => !TechnicalSegments.Contains(s)))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool IsBusinessDominant(
